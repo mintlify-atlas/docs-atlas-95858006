@@ -1,0 +1,120 @@
+---
+title: "How redb commits transactions safely"
+description: "Deep dive into redb's non-durable, 1-phase+checksum, and 2-phase commit strategies, crash recovery process, and the security analysis of XXH3-backed commits."
+---
+
+Every write transaction in redb must eventually be made durable on disk, and that process must be crash-safe: if power is cut at any point during a commit, the database must come back in a consistent state. redb achieves this with a layered approach — a non-durable in-memory mode for low-latency use cases, a default 1-phase + checksum (1PC+C) strategy that requires a single `fsync`, and an optional 2-phase commit (2PC) strategy that trades latency for a stronger security guarantee.
+
+## Non-durable commits
+
+A non-durable commit (`Durability::None`) skips `fsync` entirely. The transaction data is written to the secondary commit slot in memory but the god byte is **not** flipped; the primary slot still points to the last fully durable commit. An in-memory flag directs readers to read from the secondary slot as if it were committed.
+
+Key properties:
+
+- **Consistent on crash** — if the process or machine crashes, the database rolls back to the last durable commit. No data corruption occurs.
+- **Not durable** — work done in non-durable transactions may be lost after a crash.
+- **No page freeing** — because a non-durable commit can be rolled back at any time, freeing pages during such a commit is not permitted. Pages freed by non-durable commits are only released after a subsequent durable commit promotes the snapshot.
+
+Recovery after a crash with outstanding non-durable commits is trivial: the allocator state can be rebuilt from the primary (durable) commit slot via the normal repair process.
+
+## 1-phase + checksum commits (1PC+C)
+
+The default commit strategy performs a durable commit with a **single `fsync`**, keeping write latency low.
+
+The sequence is:
+
+1. Write all new B-tree pages and their checksums to disk (no `fsync` yet).
+2. Write the new commit slot — including the root checksums, a monotonically increasing transaction ID, and the slot's own XXH3\_128 checksum.
+3. Flip the god byte to point to the new slot and call `fsync`.
+
+If the machine crashes at any point during step 3, the next open detects the situation through the god byte and the checksums:
+
+### Correctness analysis
+
+There are two broad failure cases:
+
+**Case 1 — All or none of the data reaches disk.** This is trivially safe: either the new commit is fully present (recovery succeeds normally) or nothing changed (the old primary is still valid).
+
+**Case 2 — Some, but not all, data is written.** This splits further:
+
+- **If the `primary_bit` was not updated** — the old commit slot is still primary. The partially written new slot is ignored entirely. Safe.
+- **If the `primary_bit` was updated** — the new slot is primary. redb now checks two things:
+  - **Transaction ID** — if the new slot's transaction ID is not strictly greater than the old slot's, the new slot is treated as corrupted and replaced with the old slot.
+  - **Checksum verification** — if the transaction ID is valid but any checksum in the Merkle tree (slot checksum → root page checksum → child page checksums…) fails, the new slot is rejected and the old slot is restored.
+
+In both sub-cases the database rolls back to the previous durable commit. The combination of a monotonically increasing transaction ID and the recursive XXH3\_128 Merkle tree ensures that no partially-written state can be silently accepted.
+
+## 2-phase commits (2PC)
+
+The 2-phase commit strategy uses **two `fsync` calls** per commit, eliminating the window in which a partially-written transaction could be accepted:
+
+1. Write all new B-tree pages and checksums, then call `fsync`.
+2. Flip the god byte (setting `primary_bit` and `two_phase_commit`) and call a second `fsync`.
+
+Because the second `fsync` completes before the database considers the commit done, the primary slot is **guaranteed to be valid** when `two_phase_commit` is set in the god byte. Recovery with `two_phase_commit` set does not even look at the secondary slot.
+
+The cost is an additional `fsync` per commit. For write-heavy workloads on spinning disks or high-latency storage this can significantly reduce throughput. Use 2PC when the integrity guarantee justifies the latency, particularly when accepting externally supplied input.
+
+<Warning>
+Use 2-phase commit (`Durability::Immediate` with 2PC, or configure via `WriteTransaction::set_two_phase_commit`) when your application stores **malicious or untrusted input** and an attacker has a high degree of control over the redb process. The default 1PC+C strategy relies on a non-cryptographic checksum (XXH3) and is theoretically vulnerable to a targeted attack described below. 2PC eliminates this attack surface entirely.
+</Warning>
+
+### Security analysis of 1PC+C
+
+XXH3 is not a cryptographic hash — it is not collision-resistant against an adversary who can choose inputs. This creates a theoretical attack vector:
+
+Suppose an attacker wants the committed state of the database to appear as:
+
+```
+table.insert(malicious_key, malicious_value);
+txn.commit();
+```
+
+…when the actual transaction that ran was:
+
+```
+table.insert(malicious_key, malicious_value);
+table.insert(good_key, good_value);
+txn.commit();
+```
+
+To make this work the attacker needs all three of the following:
+
+1. **Control the flush order** — prevent the pages for `good_key` from ever reaching disk before the crash.
+2. **Introduce a crash** — during or immediately before the `fsync` in the commit.
+3. **Forge the checksums** — craft `malicious_key` / `malicious_value` such that the partial tree's XXH3\_128 checksums match what a complete tree would have.
+
+Step 3 is the hard part. Because the checksum input includes not just the attacker's key-value pair but also all other entries in the B-tree node and the child page numbers, the attacker needs read access to the current database state (or high workload control) to precompute a valid collision. This raises the practical bar considerably, but the attack is not theoretically impossible.
+
+**Recommendation:** if your application can receive data from untrusted external sources, and especially if it could be triggered to crash at a chosen moment, use 2PC.
+
+## Crash recovery
+
+When `recovery_required` is set in the god byte, redb runs a recovery procedure before the database is usable.
+
+### Quick-repair (v3 default)
+
+If the last durable commit was written with quick-repair enabled:
+
+1. The primary commit slot is guaranteed valid (it was committed with 2-phase commit internally for the allocator state write).
+2. The allocator state (region tracker + regional allocator) is loaded directly from the allocator state system table.
+
+This path is fast and requires no tree walk.
+
+### Full repair
+
+If quick-repair data is unavailable (e.g., an older database, or after restoring from a backup):
+
+**Step 1 — Select the valid commit slot.**
+redb checks the primary commit slot's slot checksum. If it is invalid, redb falls back to the secondary slot. The selected slot becomes the authoritative committed state.
+
+**Step 2 — Rebuild the allocator state.**
+redb walks the following trees and marks every page they reference as allocated:
+
+- The data tree (all user tables).
+- The system tree (all system tables, including savepoint metadata).
+- The freed trees (including all pending-free pages stored within them).
+
+All pages not marked are considered free and returned to the allocator. Savepoint pages are always covered by this walk: a savepoint's pages are either directly reachable from the data/system/freed trees (committed pages) or are in the pending-free state and therefore already in the freed tree.
+
+After repair, the `recovery_required` bit is cleared and the database is opened normally.

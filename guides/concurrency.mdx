@@ -1,0 +1,171 @@
+---
+title: "Concurrent access with multiple threads"
+description: "Share a redb Database across threads using Arc, run multiple simultaneous read transactions, and coordinate a single writer with the MVCC model."
+---
+
+redb uses a multi-version concurrency control (MVCC) model that allows an unlimited number of read transactions to run simultaneously alongside each other and alongside an active write. Only a single write transaction may exist at a time. When a second thread calls `begin_write` while a write is already in progress, it blocks until the first write transaction is committed or aborted.
+
+Sharing a `Database` between threads is straightforward: wrap it in an `Arc` and clone the handle for each thread.
+
+## Sharing the database with `Arc`
+
+`Database` implements `Send` and `Sync`, so it is safe to share via `Arc<Database>`:
+
+```rust
+use redb::{Database, TableDefinition};
+use std::sync::Arc;
+
+const TABLE: TableDefinition<&str, u32> = TableDefinition::new("my_data");
+
+fn main() -> Result<(), redb::Error> {
+    let db = Arc::new(Database::create("my_db.redb")?);
+
+    // Each thread receives a clone of the Arc
+    let db_reader = db.clone();
+    let db_writer = db.clone();
+
+    let reader = std::thread::spawn(move || -> Result<(), redb::Error> {
+        let txn = db_reader.begin_read()?;
+        let table = txn.open_table(TABLE)?;
+        println!("{:?}", table.get("key")?);
+        Ok(())
+    });
+
+    let writer = std::thread::spawn(move || -> Result<(), redb::Error> {
+        let txn = db_writer.begin_write()?;
+        {
+            let mut table = txn.open_table(TABLE)?;
+            table.insert("key", 1)?;
+        }
+        txn.commit()?;
+        Ok(())
+    });
+
+    reader.join().unwrap()?;
+    writer.join().unwrap()?;
+    Ok(())
+}
+```
+
+## The multithread example
+
+The following is the complete `multithread` example from the redb repository. It seeds the database, then spawns 8 concurrent reader threads and 2 concurrent writer threads, each running for 100 ms:
+
+```rust
+use redb::{Database, Error, TableDefinition};
+use redb::{ReadableDatabase, TableHandle};
+use std::time::Instant;
+use std::{sync::Arc, time::Duration};
+
+fn main() -> Result<(), Error> {
+    let db = Database::create("my_db.redb")?;
+    let definition: TableDefinition<&str, u32> = TableDefinition::new("my_data");
+
+    let db = Arc::new(db);
+    // Seed the database with some information
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(definition)?;
+        table.insert(&0.to_string().as_str(), 0_u32)?;
+        table.insert("a".to_string().as_str(), 0_u32)?;
+    }
+    write_txn.commit()?;
+
+    let read_threads = 8;
+    let write_threads = 2;
+    let mut handles = Vec::with_capacity(read_threads + write_threads);
+
+    for i in 0..read_threads {
+        let db = db.clone();
+        let h = std::thread::spawn(move || -> Result<(), Error> {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(100) {
+                let read_txn = db.begin_read()?;
+                let table = read_txn.open_table(definition)?;
+                for (k, v) in table.range("0"..)?.flatten() {
+                    println!("From read_thread #{}: {:?}, {:?}", i, k.value(), v.value());
+                }
+            }
+            Ok(())
+        });
+        handles.push(h);
+    }
+
+    for i in 0..write_threads {
+        let db = db.clone();
+        let h = std::thread::spawn(move || -> Result<(), Error> {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(100) {
+                let write_txn = db.begin_write()?;
+                {
+                    let mut table = write_txn.open_table(definition)?;
+                    table.insert(&i.to_string().as_str(), i as u32)?;
+                    table.insert("a".to_string().as_str(), i as u32)?;
+                    println!("Inserted data from write_thread #{i}");
+                }
+                write_txn.commit()?;
+            }
+            Ok(())
+        });
+        handles.push(h);
+    }
+
+    for handle in handles {
+        if let Err(e) = handle.join() {
+            println!("{e:?}");
+        }
+    }
+
+    // Inspect the final state
+    let read_txn = db.begin_read()?;
+    let tables = read_txn.list_tables()?;
+    for table in tables {
+        println!("Table: {}", table.name());
+    }
+
+    let table = read_txn.open_table(definition)?;
+    for (k, v) in table.range("0"..)?.flatten() {
+        println!("{:?}, {:?}", k.value(), v.value());
+    }
+
+    Ok(())
+}
+```
+
+Key observations from the example:
+
+- `Arc::new(db)` is called once; every thread receives a `db.clone()` that increments the reference count.
+- Reader threads call `begin_read()` freely — reads never block each other.
+- Writer threads call `begin_write()` — the second writer blocks inside `begin_write` until the first writer's transaction completes.
+- Transactions are committed inside the thread where they were created; `WriteTransaction` and `ReadTransaction` are `Send`, so they can also be moved across thread boundaries before committing if needed.
+
+<Note>
+redb enforces the single-writer rule at the `Database` level, not the thread level. If two threads both call `begin_write` simultaneously, the second call blocks (it does not return an error) until the first transaction is finished. There is no way to opt out of this serialization — it is fundamental to redb's ACID guarantees.
+</Note>
+
+## `ReadTransaction` lifetime management
+
+A `ReadTransaction` holds a snapshot of the database. As long as it is alive, redb cannot free pages that became unreachable after the snapshot was taken. Keep read transactions short-lived to avoid unbounded storage growth.
+
+If a `ReadTransaction` is still referenced by an open table or other object when you try to drop it, the drop is deferred. If you call `begin_write` while a read transaction is still alive (held in a live table or range iterator on another thread), the write will proceed — it just cannot reclaim those snapshot pages until the read transaction is eventually dropped.
+
+```rust
+fn short_lived_read(db: &redb::Database) -> Result<u32, redb::Error> {
+    let txn = db.begin_read()?;
+    // Open the table, read one value, then let `txn` drop at end of scope
+    let table = txn.open_table(redb::TableDefinition::<u64, u32>::new("counters"))?;
+    Ok(table.get(&0)?.map(|v| v.value()).unwrap_or(0))
+    // `txn` is dropped here, releasing the snapshot
+}
+```
+
+## Read-only database access
+
+If you only need reads, consider opening the database as a `ReadOnlyDatabase`. Multiple processes can open the same file as `ReadOnlyDatabase` concurrently, but it cannot be opened at the same time as a writable `Database`.
+
+```rust
+use redb::ReadOnlyDatabase;
+
+let db = ReadOnlyDatabase::open("my_db.redb")?;
+let txn = db.begin_read()?;
+```

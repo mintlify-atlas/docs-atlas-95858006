@@ -1,0 +1,212 @@
+---
+title: "TableDefinition — typed table handles"
+description: "API reference for TableDefinition<K,V> and MultimapTableDefinition<K,V>: declare typed, named table handles used to open tables inside redb transactions."
+---
+
+`TableDefinition<K, V>` is a lightweight, zero-allocation descriptor that names a table and records its key and value types at compile time. You create one constant per table at module level and pass it to `open_table` whenever you want to read or write that table. `MultimapTableDefinition<K, V>` plays the same role for multimap tables.
+
+## Why use const definitions
+
+Declaring table definitions as `const` at module level provides several benefits. The name and types are checked once at the call site rather than reconstructed on each use. Because `TableDefinition` is `Copy`, passing it to multiple transactions never requires a heap allocation. Any mismatch between the types used at definition time and those expected by an existing on-disk table is caught at the first `open_table` call and surfaced as a `TableError`.
+
+```rust
+use redb::{TableDefinition, MultimapTableDefinition};
+
+// Declare once, share everywhere
+const USERS: TableDefinition<u64, &str> = TableDefinition::new("users");
+const TAGS:  MultimapTableDefinition<u64, &str> = MultimapTableDefinition::new("tags");
+```
+
+---
+
+## TableDefinition\<K, V\>
+
+```rust
+pub struct TableDefinition<'a, K: Key + 'static, V: Value + 'static> { /* ... */ }
+```
+
+`TableDefinition` is `Copy + Clone + Display`. The `'a` lifetime refers to the string literal used as the name; in practice it is always `'static` when declared as a `const`.
+
+### Type parameters
+
+<ParamField path="K" type="Key + 'static">
+  The key type. Must implement `Key`, which in turn requires `Value` plus an ordering over serialised bytes. Built-in implementations are provided for primitive integers, `&str`, `&[u8]`, and tuples of up to 12 `Key` types.
+</ParamField>
+
+<ParamField path="V" type="Value + 'static">
+  The value type. Must implement `Value`. All `Key` types also implement `Value`. Additional implementations exist for primitives, slices, and fixed-size arrays.
+</ParamField>
+
+### new
+
+```rust
+pub const fn new(name: &'a str) -> Self
+```
+
+Constructs a table definition with the given name.
+
+<ParamField path="name" type="&'a str">
+  A non-empty string that uniquely identifies the table within the database file. The same name used across different type parameters refers to different logical tables and will produce a `TableError` on open if the types do not match.
+</ParamField>
+
+<Warning>
+  Panics at compile time (for string literals) or runtime if `name` is empty.
+</Warning>
+
+### name
+
+Accessed through the `TableHandle` trait:
+
+```rust
+pub trait TableHandle {
+    fn name(&self) -> &str;
+}
+```
+
+Returns the name string passed to `new`.
+
+### Usage in transactions
+
+```rust
+use redb::{Database, TableDefinition};
+
+const SCORES: TableDefinition<&str, i64> = TableDefinition::new("scores");
+
+// Write transaction
+let write_txn = db.begin_write()?;
+{
+    let mut table = write_txn.open_table(SCORES)?;
+    table.insert("alice", &100)?;
+}
+write_txn.commit()?;
+
+// Read transaction
+let read_txn = db.begin_read()?;
+let table = read_txn.open_table(SCORES)?;
+let score = table.get("alice")?.unwrap().value();
+```
+
+### Display
+
+`TableDefinition` implements `Display`, printing `name<K, V>`:
+
+```
+scores<&str, i64>
+```
+
+---
+
+## MultimapTableDefinition\<K, V\>
+
+```rust
+pub struct MultimapTableDefinition<'a, K: Key + 'static, V: Key + 'static> { /* ... */ }
+```
+
+Identical in design to `TableDefinition` but targets multimap tables. `V` must implement `Key` (not just `Value`) because multimap values are stored in an inner B-tree.
+
+### new
+
+```rust
+pub const fn new(name: &'a str) -> Self
+```
+
+Constructs a multimap table definition. Panics if `name` is empty.
+
+<ParamField path="name" type="&'a str">
+  Non-empty unique name for the multimap table.
+</ParamField>
+
+### Usage in transactions
+
+```rust
+use redb::{Database, MultimapTableDefinition};
+
+const FRIENDS: MultimapTableDefinition<u64, u64> =
+    MultimapTableDefinition::new("friends");
+
+let write_txn = db.begin_write()?;
+{
+    let mut table = write_txn.open_multimap_table(FRIENDS)?;
+    table.insert(&1u64, &2u64)?;
+    table.insert(&1u64, &3u64)?;
+}
+write_txn.commit()?;
+```
+
+---
+
+## TableHandle trait
+
+```rust
+pub trait TableHandle {
+    fn name(&self) -> &str;
+}
+```
+
+Implemented by `TableDefinition`, `Table`, `ReadOnlyTable`, and `UntypedTableHandle`. Provides a uniform way to obtain the table name regardless of which handle type you hold.
+
+---
+
+## MultimapTableHandle trait
+
+```rust
+pub trait MultimapTableHandle {
+    fn name(&self) -> &str;
+}
+```
+
+Implemented by `MultimapTableDefinition`, `MultimapTable`, `ReadOnlyMultimapTable`, and `UntypedMultimapTableHandle`.
+
+---
+
+## UntypedTableHandle
+
+```rust
+#[derive(Clone)]
+pub struct UntypedTableHandle { /* ... */ }
+```
+
+A name-only, type-erased table handle. Implements `TableHandle`. Returned by APIs that enumerate tables without knowing their types at compile time, such as `ReadableDatabase::list_tables`.
+
+```rust
+let read_txn = db.begin_read()?;
+for handle in read_txn.list_tables()? {
+    println!("table: {}", handle.name());
+}
+```
+
+---
+
+## UntypedMultimapTableHandle
+
+```rust
+#[derive(Clone)]
+pub struct UntypedMultimapTableHandle { /* ... */ }
+```
+
+A name-only, type-erased multimap table handle. Implements `MultimapTableHandle`. Returned by `ReadableDatabase::list_multimap_tables`.
+
+```rust
+let read_txn = db.begin_read()?;
+for handle in read_txn.list_multimap_tables()? {
+    println!("multimap table: {}", handle.name());
+}
+```
+
+---
+
+## Choosing key and value types
+
+| Rust type | `Key` | `Value` | Notes |
+|---|---|---|---|
+| `u8`, `u16`, `u32`, `u64`, `u128` | Yes | Yes | Fixed-width, sorted numerically |
+| `i8`, `i16`, `i32`, `i64`, `i128` | Yes | Yes | Fixed-width, sorted numerically |
+| `&str` | Yes | Yes | Variable-width, sorted lexicographically |
+| `&[u8]` | Yes | Yes | Variable-width, sorted lexicographically |
+| `[u8; N]` | Yes | Yes | Fixed-width |
+| `(A, B, ...)` | Yes (if all `Key`) | Yes | Composite keys, up to 12 elements |
+| `f32`, `f64` | No | Yes | Not `Key`; cannot be used as a map key |
+
+<Tip>
+  Use composite key tuples such as `(u64, &str)` to implement namespace prefixes or secondary indexes without a separate table.
+</Tip>

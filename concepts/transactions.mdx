@@ -1,0 +1,167 @@
+---
+title: "How redb transactions and MVCC isolation work"
+description: "Understand redb's ACID transaction model: MVCC isolation, single-writer/multiple-reader concurrency, write and read transaction lifecycles, and durability."
+---
+
+Every read and write in redb goes through a transaction. Transactions are the unit of atomicity, consistency, isolation, and durability (ACID). This page explains the two transaction types—`WriteTransaction` and `ReadTransaction`—the multi-version concurrency control (MVCC) model that lets readers and writers operate simultaneously, and the durability levels you can choose from.
+
+## MVCC isolation and concurrency model
+
+redb uses a copy-on-write B-tree as its storage engine. When a write transaction commits, it creates a new version of the tree root rather than modifying pages in place. Any read transaction that is already open continues to see the snapshot it captured at the moment it began, regardless of concurrent writes.
+
+This gives redb a **single-writer / multiple-reader** concurrency model:
+
+- Any number of `ReadTransaction` objects may be alive simultaneously, each seeing a consistent point-in-time snapshot.
+- Only one `WriteTransaction` may be active at a time. If you call `begin_write` while a write transaction is already in progress, the call blocks until the active write transaction completes.
+- Read transactions and write transactions do not block each other.
+
+<Note>
+Because read transactions capture a snapshot, pages that are freed by a later write cannot be reclaimed until all read transactions that could see those pages have been dropped. Long-lived read transactions can therefore prevent the database file from shrinking.
+</Note>
+
+## Write transactions
+
+A write transaction is obtained from `Database::begin_write`. It provides both read and write access to tables.
+
+<Steps>
+  <Step title="Begin the transaction">
+    ```rust
+    use redb::{Database, Error, ReadableDatabase, TableDefinition};
+
+    const TABLE: TableDefinition<&str, u64> = TableDefinition::new("my_data");
+
+    fn main() -> Result<(), Error> {
+        let db = Database::create("my_database.redb")?;
+        let write_txn = db.begin_write()?;
+    ```
+  </Step>
+  <Step title="Open a table and write data">
+    Tables are opened by passing a `TableDefinition` to `open_table`. In a write transaction the table is created if it does not already exist. Drop the `Table` handle before committing.
+
+    ```rust
+        {
+            let mut table = write_txn.open_table(TABLE)?;
+            table.insert("hello", &42)?;
+            table.insert("world", &99)?;
+        } // table dropped here, staged changes are flushed back to the transaction
+    ```
+  </Step>
+  <Step title="Commit or abort">
+    Call `commit()` to persist the changes or `abort()` to discard them. If the transaction is dropped without calling either method, it is automatically aborted.
+
+    ```rust
+        write_txn.commit()?;
+        Ok(())
+    }
+    ```
+  </Step>
+</Steps>
+
+### Reading inside a write transaction
+
+A `WriteTransaction` also has read access. You can call `open_table` and then `get` or `range` without any extra ceremony:
+
+```rust
+let write_txn = db.begin_write()?;
+{
+    let mut table = write_txn.open_table(TABLE)?;
+    table.insert("counter", &1)?;
+
+    // Read back the value we just inserted
+    let val = table.get("counter")?.unwrap();
+    assert_eq!(val.value(), 1);
+}
+write_txn.commit()?;
+```
+
+## Read transactions
+
+A read transaction captures a consistent snapshot of the database at the moment `begin_read` is called. It sees all data committed before that point and nothing committed after.
+
+```rust
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+
+const TABLE: TableDefinition<&str, u64> = TableDefinition::new("my_data");
+
+fn read_example(db: &redb::Database) -> Result<(), redb::Error> {
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(TABLE)?;
+
+    // Point lookup
+    if let Some(guard) = table.get("hello")? {
+        println!("hello = {}", guard.value());
+    }
+
+    // Range scan
+    for result in table.range("a".."z")? {
+        let (key, value) = result?;
+        println!("{} -> {}", key.value(), value.value());
+    }
+
+    Ok(())
+}
+```
+
+`ReadTransaction::open_table` returns a `TableError::TableDoesNotExist` error if the table has never been created, unlike the write-transaction variant which creates it on demand.
+
+Read transactions are closed automatically when they are dropped. You can also close one explicitly with `ReadTransaction::close`, which verifies that no table handles are still referencing the transaction.
+
+## Transaction lifecycle
+
+```
+begin_write / begin_read
+        │
+        ▼
+   open_table(s)
+        │
+        ▼
+  insert / get / range / remove ...
+        │
+        ▼
+   drop table handle(s)
+        │
+        ▼
+  commit() ──► changes visible to future transactions
+    or
+  abort()  ──► all changes discarded
+    or
+  drop     ──► implicitly aborted
+```
+
+<Warning>
+A write transaction that is dropped without calling `commit()` is silently aborted. All changes made in that transaction are lost. Always call `commit()` explicitly when you want durability.
+</Warning>
+
+## Durability levels
+
+By default every committed write transaction is durable—`fsync` is called before `commit()` returns, so the data survives a process crash or power loss. You can relax this guarantee for write-heavy workloads where you control crash recovery yourself:
+
+```rust
+use redb::{Database, Durability, Error, ReadableDatabase, TableDefinition};
+
+const TABLE: TableDefinition<u64, u64> = TableDefinition::new("counters");
+
+fn batch_insert(db: &Database, entries: &[(u64, u64)]) -> Result<(), Error> {
+    let write_txn = db.begin_write()?;
+    write_txn.set_durability(Durability::None)?;
+    {
+        let mut table = write_txn.open_table(TABLE)?;
+        for (k, v) in entries {
+            table.insert(k, v)?;
+        }
+    }
+    write_txn.commit()?; // fast: no fsync
+    Ok(())
+}
+```
+
+The two available durability levels are:
+
+| Level | Behavior |
+|-------|----------|
+| `Durability::Immediate` | Default. `fsync` is called during commit. Data survives crashes and power loss. |
+| `Durability::None` | No `fsync`. The commit is visible to other transactions in the same process but may be lost on a crash. Data becomes durable only after a subsequent `Durability::Immediate` commit. |
+
+<Tip>
+Use `Durability::None` for a sequence of writes that you plan to cap with a single durable commit. This is a common pattern for bulk loading data—write thousands of rows with `Durability::None` and then do one final commit with `Durability::Immediate`.
+</Tip>

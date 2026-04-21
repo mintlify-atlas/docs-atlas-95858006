@@ -1,0 +1,516 @@
+---
+title: "WriteTransaction — redb API reference"
+description: "Reference for WriteTransaction: open, modify, rename, and delete tables, manage savepoints, set durability, and commit or abort the transaction."
+---
+
+`WriteTransaction` is the single read/write transaction that may be open at any given time in a redb database. You obtain one by calling [`Database::begin_write`](/api/database#begin_write). Every mutation — opening a table, inserting data, deleting a table — must happen inside a `WriteTransaction`. When you are done, call [`commit`](#commit) to persist the changes or [`abort`](#abort) to discard them. If the transaction is dropped without either being called, redb automatically aborts it.
+
+<Note>
+Only one `WriteTransaction` may exist at a time. Attempting to open a second one while the first is still alive will block (or return an error, depending on how the `Database` is configured).
+</Note>
+
+---
+
+## `open_table`
+
+```rust
+pub fn open_table<'txn, K: Key + 'static, V: Value + 'static>(
+    &'txn self,
+    definition: TableDefinition<K, V>,
+) -> Result<Table<'txn, K, V>, TableError>
+```
+
+Opens a typed key-value table for reading and writing. The table is created if it does not already exist. The returned `Table` borrows the transaction for its lifetime, so only one handle per table name may be open at a time.
+
+<ParamField path="definition" type="TableDefinition<K, V>" required>
+  A compile-time constant that names the table and carries the key and value types as type parameters. Declare it with `TableDefinition::new("name")`.
+</ParamField>
+
+**Errors**
+
+| Variant | Cause |
+|---|---|
+| `TableError::TableTypeMismatch` | The existing table was created with different key or value types. |
+| `TableError::TableIsMultimap` | The name refers to a multimap table, not a regular table. |
+| `TableError::TableAlreadyOpen` | A handle to this table is already open in this transaction. |
+| `TableError::Storage` | An underlying I/O or corruption error. |
+
+```rust
+use redb::{Database, TableDefinition};
+
+const USERS: TableDefinition<u64, &str> = TableDefinition::new("users");
+
+let db = Database::create("my.db")?;
+let txn = db.begin_write()?;
+{
+    let mut table = txn.open_table(USERS)?;
+    table.insert(&1, "alice")?;
+}
+txn.commit()?;
+```
+
+---
+
+## `open_multimap_table`
+
+```rust
+pub fn open_multimap_table<'txn, K: Key + 'static, V: Key + 'static>(
+    &'txn self,
+    definition: MultimapTableDefinition<K, V>,
+) -> Result<MultimapTable<'txn, K, V>, TableError>
+```
+
+Opens a typed multimap table for reading and writing. A multimap table associates each key with a sorted set of values, allowing duplicate keys. The table is created if it does not already exist.
+
+<ParamField path="definition" type="MultimapTableDefinition<K, V>" required>
+  A compile-time constant created with `MultimapTableDefinition::new("name")`.
+</ParamField>
+
+**Errors** — same variants as [`open_table`](#open_table), plus `TableError::TableIsNotMultimap` if the name refers to a regular table.
+
+```rust
+use redb::{Database, MultimapTableDefinition};
+
+const TAGS: MultimapTableDefinition<u64, &str> = MultimapTableDefinition::new("tags");
+
+let txn = db.begin_write()?;
+{
+    let mut tags = txn.open_multimap_table(TAGS)?;
+    tags.insert(&1, "rust")?;
+    tags.insert(&1, "database")?;
+}
+txn.commit()?;
+```
+
+---
+
+## `open_untyped_table`
+
+<Note>
+redb does not expose an `open_untyped_table` method on `WriteTransaction`. On the write path, tables are always opened via a typed `TableDefinition`. Use `delete_table` or `rename_table` with an `UntypedTableHandle` when you need to manipulate a table without knowing its types at compile time. Untyped read access is available via `ReadTransaction::open_untyped_table`.
+</Note>
+
+---
+
+## `rename_table`
+
+```rust
+pub fn rename_table(
+    &self,
+    definition: impl TableHandle,
+    new_name: impl TableHandle,
+) -> Result<(), TableError>
+```
+
+Renames a regular table. The source handle is consumed so callers can pass an open `Table` directly without triggering a `TableAlreadyOpen` error.
+
+<ParamField path="definition" type="impl TableHandle" required>
+  The current table handle. May be a `TableDefinition`, an `UntypedTableHandle`, or an open `Table`.
+</ParamField>
+
+<ParamField path="new_name" type="impl TableHandle" required>
+  A handle whose `name()` will become the new table name.
+</ParamField>
+
+**Errors**
+
+| Variant | Cause |
+|---|---|
+| `TableError::TableDoesNotExist` | No table with the source name was found. |
+| `TableError::TableExists` | A table with `new_name` already exists. |
+| `TableError::TableAlreadyOpen` | The source table is open in this transaction (only possible when not passing the `Table` itself). |
+
+```rust
+use redb::TableDefinition;
+
+const OLD: TableDefinition<u64, &str> = TableDefinition::new("old_name");
+const NEW: TableDefinition<u64, &str> = TableDefinition::new("new_name");
+
+let txn = db.begin_write()?;
+txn.rename_table(OLD, NEW)?;
+txn.commit()?;
+```
+
+---
+
+## `rename_multimap_table`
+
+```rust
+pub fn rename_multimap_table(
+    &self,
+    definition: impl MultimapTableHandle,
+    new_name: impl MultimapTableHandle,
+) -> Result<(), TableError>
+```
+
+Renames a multimap table. Identical semantics to [`rename_table`](#rename_table), but operates on multimap tables.
+
+---
+
+## `delete_table`
+
+```rust
+pub fn delete_table(&self, definition: impl TableHandle) -> Result<bool, TableError>
+```
+
+Deletes a regular table and all its data. Returns `true` if the table existed, `false` if it did not.
+
+<ParamField path="definition" type="impl TableHandle" required>
+  Any `TableHandle` — e.g. a `TableDefinition` or an `UntypedTableHandle`. Passing an open `Table` is also supported; the handle is consumed first.
+</ParamField>
+
+**Errors** — `TableError::TableAlreadyOpen` if a separate handle to the table is still open. `TableError::Storage` for I/O errors.
+
+```rust
+use redb::TableDefinition;
+
+const STALE: TableDefinition<u64, &str> = TableDefinition::new("stale");
+
+let txn = db.begin_write()?;
+let existed = txn.delete_table(STALE)?;
+txn.commit()?;
+```
+
+---
+
+## `delete_multimap_table`
+
+```rust
+pub fn delete_multimap_table(
+    &self,
+    definition: impl MultimapTableHandle,
+) -> Result<bool, TableError>
+```
+
+Deletes a multimap table and all its data. Returns `true` if the table existed. Same semantics as [`delete_table`](#delete_table).
+
+---
+
+## `list_tables`
+
+```rust
+pub fn list_tables(&self) -> Result<impl Iterator<Item = UntypedTableHandle> + '_>
+```
+
+Returns an iterator over the names of all regular (non-multimap) tables that currently exist in the database, as seen by this transaction.
+
+```rust
+let txn = db.begin_write()?;
+for handle in txn.list_tables()? {
+    println!("{}", handle.name());
+}
+txn.abort()?;
+```
+
+---
+
+## `list_multimap_tables`
+
+```rust
+pub fn list_multimap_tables(
+    &self,
+) -> Result<impl Iterator<Item = UntypedMultimapTableHandle> + '_>
+```
+
+Returns an iterator over the names of all multimap tables visible to this transaction.
+
+---
+
+## `commit`
+
+```rust
+pub fn commit(mut self) -> Result<(), CommitError>
+```
+
+Commits the transaction, making all writes durable at the level specified by [`set_durability`](#set_durability) (default: `Durability::Immediate`). Consumes `self`; you cannot use the transaction after calling `commit`.
+
+**Errors** — `CommitError::Storage` wrapping any I/O error encountered while flushing data.
+
+<Warning>
+If `commit` returns an error the transaction has not been committed. The data has already been rolled back at that point and the database remains consistent.
+</Warning>
+
+```rust
+let txn = db.begin_write()?;
+{
+    let mut table = txn.open_table(USERS)?;
+    table.insert(&42, "bob")?;
+}
+txn.commit()?; // Data is now durable on disk
+```
+
+---
+
+## `abort`
+
+```rust
+pub fn abort(mut self) -> Result
+```
+
+Rolls back all writes made in this transaction. Consumes `self`. This is equivalent to dropping the transaction, but returns any storage error that occurred during rollback.
+
+```rust
+let txn = db.begin_write()?;
+{
+    let mut table = txn.open_table(USERS)?;
+    table.insert(&99, "temp")?;
+}
+txn.abort()?; // Nothing was written
+```
+
+<Tip>
+Dropping a `WriteTransaction` without calling `commit` or `abort` automatically calls `abort`. Explicitly calling `abort` is useful when you want to propagate any error that occurs during the rollback.
+</Tip>
+
+---
+
+## `set_durability`
+
+```rust
+pub fn set_durability(&mut self, durability: Durability) -> Result<(), SetDurabilityError>
+```
+
+Sets the durability level for this transaction. Must be called before any tables are opened or data written. The default level is `Durability::Immediate`.
+
+<ParamField path="durability" type="Durability" required>
+  One of:
+  - `Durability::Immediate` — the commit is guaranteed durable as soon as `commit()` returns.
+  - `Durability::None` — the commit is not persisted until a subsequent `Durability::Immediate` commit. Faster, but data can be lost on crash.
+</ParamField>
+
+**Errors**
+
+| Variant | Cause |
+|---|---|
+| `SetDurabilityError::PersistentSavepointModified` | A persistent savepoint was created or deleted in this transaction, which requires `Durability::Immediate`. |
+
+```rust
+use redb::Durability;
+
+let mut txn = db.begin_write()?;
+txn.set_durability(Durability::None)?;
+// fast writes — will be flushed by the next Immediate commit
+```
+
+---
+
+## `set_two_phase_commit`
+
+```rust
+pub fn set_two_phase_commit(&mut self, enabled: bool)
+```
+
+Enables or disables two-phase commit (disabled by default). When enabled, redb performs two `fsync` calls per commit — once after writing the new database state, and again after flipping the primary commit slot pointer. This guards against a narrow class of adversarial crash scenarios described in the [design document](https://github.com/cberner/redb/blob/master/docs/design.md).
+
+<Note>
+Two-phase commit is automatically enabled when `set_quick_repair(true)` is called.
+</Note>
+
+---
+
+## `set_quick_repair`
+
+```rust
+pub fn set_quick_repair(&mut self, enabled: bool)
+```
+
+Enables or disables quick-repair mode (disabled by default). When enabled, redb persists allocator state on every commit so that crash recovery skips the full database walk, making reopening after a crash nearly instant at the cost of slightly slower commits.
+
+---
+
+## `ephemeral_savepoint`
+
+```rust
+pub fn ephemeral_savepoint(&self) -> Result<Savepoint, SavepointError>
+```
+
+Creates an in-memory snapshot of the current database state. The savepoint exists only as long as the returned `Savepoint` value is alive — dropping it immediately releases all resources held on its behalf.
+
+**Errors**
+
+| Variant | Cause |
+|---|---|
+| `SavepointError::InvalidSavepoint` | The transaction is "dirty" — at least one table has already been opened. |
+| `SavepointError::Storage` | Underlying storage error. |
+
+```rust
+// Take a snapshot before a risky batch of writes
+let sp = txn.ephemeral_savepoint()?;
+
+{
+    let mut table = txn.open_table(USERS)?;
+    table.insert(&1, "alice")?;
+}
+
+// Oops — roll back
+txn.restore_savepoint(&sp)?;
+```
+
+---
+
+## `persistent_savepoint`
+
+```rust
+pub fn persistent_savepoint(&self) -> Result<u64, SavepointError>
+```
+
+Creates a savepoint that survives across transaction boundaries. The savepoint is written to the database and remains valid until explicitly deleted with [`delete_persistent_savepoint`](#delete_persistent_savepoint). Returns the numeric savepoint ID.
+
+**Errors**
+
+| Variant | Cause |
+|---|---|
+| `SavepointError::InvalidSavepoint` | The transaction is dirty. |
+| `SavepointError::ImmediateDurabilityRequired` | The transaction's durability is less than `Durability::Immediate`. |
+| `SavepointError::Storage` | Underlying storage error. |
+
+<Warning>
+While any savepoint exists — ephemeral or persistent — pages that become unreachable are not freed. Keep savepoint lifetimes as short as possible to avoid unbounded space growth.
+</Warning>
+
+```rust
+// Create a durable checkpoint before a migration
+let sp_id = txn.persistent_savepoint()?;
+txn.commit()?;
+
+// Later, in a new transaction:
+let txn2 = db.begin_write()?;
+let sp = txn2.get_persistent_savepoint(sp_id)?;
+txn2.restore_savepoint(&sp)?;
+txn2.commit()?;
+```
+
+---
+
+## `get_persistent_savepoint`
+
+```rust
+pub fn get_persistent_savepoint(&self, id: u64) -> Result<Savepoint, SavepointError>
+```
+
+Retrieves a previously created persistent savepoint by its numeric ID.
+
+<ParamField path="id" type="u64" required>
+  The savepoint ID returned by a previous call to `persistent_savepoint`.
+</ParamField>
+
+**Errors** — `SavepointError::InvalidSavepoint` if no savepoint with that ID exists.
+
+---
+
+## `delete_persistent_savepoint`
+
+```rust
+pub fn delete_persistent_savepoint(&self, id: u64) -> Result<bool, SavepointError>
+```
+
+Deletes a persistent savepoint. Returns `true` if it existed, `false` otherwise. If the transaction is later aborted, the deletion is rolled back and the savepoint is restored.
+
+<ParamField path="id" type="u64" required>
+  The savepoint ID to delete.
+</ParamField>
+
+**Errors**
+
+| Variant | Cause |
+|---|---|
+| `SavepointError::ImmediateDurabilityRequired` | Durability is not `Immediate`. |
+| `SavepointError::Storage` | Underlying storage error. |
+
+---
+
+## `list_persistent_savepoints`
+
+```rust
+pub fn list_persistent_savepoints(&self) -> Result<impl Iterator<Item = u64>>
+```
+
+Returns an iterator over all persistent savepoint IDs currently stored in the database.
+
+```rust
+let txn = db.begin_write()?;
+for id in txn.list_persistent_savepoints()? {
+    println!("savepoint {id}");
+}
+txn.abort()?;
+```
+
+---
+
+## `restore_savepoint`
+
+```rust
+pub fn restore_savepoint(&mut self, savepoint: &Savepoint) -> Result<(), SavepointError>
+```
+
+Rolls the transaction's view of the database back to the state captured in `savepoint`. All writes made since the savepoint was created are discarded, and all savepoints created after it are invalidated.
+
+<ParamField path="savepoint" type="&Savepoint" required>
+  A `Savepoint` obtained from `ephemeral_savepoint`, `persistent_savepoint` (via `get_persistent_savepoint`), or a previous call in this transaction.
+</ParamField>
+
+**Errors**
+
+| Variant | Cause |
+|---|---|
+| `SavepointError::InvalidSavepoint` | The savepoint is from a different database, or has been invalidated by the restoration of an earlier savepoint. |
+| `SavepointError::ImmediateDurabilityRequired` | There are newer persistent savepoints that would need to be deleted, but durability is not `Immediate`. |
+| `SavepointError::Storage` | Underlying storage error. |
+
+<Warning>
+Calling `restore_savepoint` invalidates all savepoints created after the restored one. Attempting to restore an invalidated savepoint returns `SavepointError::InvalidSavepoint`.
+</Warning>
+
+```rust
+let sp = txn.ephemeral_savepoint()?;
+
+{
+    let mut table = txn.open_table(USERS)?;
+    table.insert(&1, "alice")?;
+    table.insert(&2, "bob")?;
+}
+
+// Undo everything since sp
+txn.restore_savepoint(&sp)?;
+
+// The table is now empty again (as it was when sp was taken)
+txn.commit()?;
+```
+
+---
+
+## `stats`
+
+```rust
+pub fn stats(&self) -> Result<DatabaseStats>
+```
+
+Returns storage statistics for the entire database as seen by this transaction.
+
+The returned [`DatabaseStats`](#databasestats) provides byte-level breakdowns of how space is being used across all tables.
+
+```rust
+let txn = db.begin_write()?;
+let s = txn.stats()?;
+println!("allocated pages: {}", s.allocated_pages());
+println!("stored bytes:    {}", s.stored_bytes());
+println!("fragmented:      {}", s.fragmented_bytes());
+txn.abort()?;
+```
+
+---
+
+## `DatabaseStats`
+
+`DatabaseStats` is returned by both `WriteTransaction::stats()` and `ReadTransaction::stats()`.
+
+| Method | Returns | Description |
+|---|---|---|
+| `tree_height()` | `u32` | Maximum B-tree depth across all tables. |
+| `allocated_pages()` | `u64` | Total number of pages currently allocated. |
+| `leaf_pages()` | `u64` | Number of leaf pages holding user data. |
+| `branch_pages()` | `u64` | Number of internal B-tree branch pages. |
+| `stored_bytes()` | `u64` | Raw bytes of inserted keys and values (no overhead). |
+| `metadata_bytes()` | `u64` | Bytes used by internal indexing structures. |
+| `fragmented_bytes()` | `u64` | Bytes wasted due to fragmentation. |
+| `page_size()` | `usize` | Bytes per database page. |

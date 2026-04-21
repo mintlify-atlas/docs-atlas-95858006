@@ -1,0 +1,84 @@
+---
+title: "redb: ACID-compliant embedded database for Rust"
+description: "redb is a pure-Rust embedded key-value store with zero-copy reads, MVCC concurrency, and crash-safe ACID transactions. No external C or C++ dependencies."
+---
+
+redb is an embedded key-value database written entirely in pure Rust. It stores data in a collection of copy-on-write B-trees and provides fully ACID-compliant transactions, zero-copy reads via a `BTreeMap`-based API, and MVCC concurrency that lets multiple readers run alongside a single writer without blocking. This page covers what redb is, its key features, how it compares to similar libraries, and the current project status.
+
+## What is redb?
+
+redb is a file-backed embedded database — it runs in the same process as your application and persists data to a single file on disk. There is no server process, no network overhead, and no external runtime to manage. The API is inspired by [lmdb](http://www.lmdb.tech/doc/) but designed for idiomatic Rust, with typed table definitions checked at compile time and transactions enforced through Rust's ownership model.
+
+## Key features
+
+- **Zero-copy reads** — values are accessed directly from the memory-mapped file with no deserialization overhead.
+- **ACID transactions** — every write is atomic, consistent, isolated, and durable. Transactions either commit fully or roll back completely.
+- **MVCC concurrency** — multiple read transactions run concurrently alongside a single write transaction with no blocking between them.
+- **Crash safety** — all pages are checksummed. Partially-written transactions are detected and discarded on the next open.
+- **Savepoints and rollbacks** — create a snapshot of the current database state and restore it at any time, even across process restarts.
+- **Pure Rust** — no C dependencies, no unsafe FFI, compiles anywhere Rust does.
+
+## How redb compares to alternatives
+
+redb occupies a similar space to lmdb and rocksdb but with a different set of trade-offs.
+
+| | redb | lmdb | rocksdb | sled |
+|---|---|---|---|---|
+| Language | Pure Rust | C | C++ | Rust |
+| ACID transactions | Yes | Yes | Yes | Partial |
+| MVCC | Yes | Yes | Yes | No |
+| Crash safety | Yes | Yes | Yes | Yes |
+| Savepoints | Yes | No | No | No |
+| Write model | Copy-on-write B-tree | Copy-on-write B-tree | LSM tree | LSM tree |
+| External deps | None | libclang | libclang | None |
+
+**lmdb** is faster on random reads and bulk loads, but requires a C toolchain and has a less ergonomic API. **rocksdb** offers better write throughput for batch workloads and better storage compaction, but is significantly more complex to configure and also requires a C++ toolchain. **sled** is pure Rust but uses an LSM tree without full ACID guarantees and is less actively maintained.
+
+redb is a strong choice when you need ACID guarantees, savepoint/rollback support, zero external dependencies, and a safe Rust API.
+
+## Performance benchmarks
+
+redb has similar performance to other top embedded key-value stores. Benchmarks run on a Ryzen 9950X3D with Samsung 9100 PRO NVMe.
+
+| | redb | lmdb | rocksdb | sled | fjall | sqlite |
+|---|---|---|---|---|---|---|
+| bulk load | 17063ms | **9232ms** | 13969ms | 24971ms | 18619ms | 15341ms |
+| individual writes | **920ms** | 1598ms | 2432ms | 2701ms | 3488ms | 7040ms |
+| batch writes | 1595ms | 942ms | 451ms | 853ms | **353ms** | 2625ms |
+| len() | **0ms** | **0ms** | 749ms | 1573ms | 1181ms | 30ms |
+| random reads | 1138ms | **637ms** | 2911ms | 1601ms | 2177ms | 4283ms |
+| random reads | 934ms | **631ms** | 2884ms | 1592ms | 2357ms | 4281ms |
+| random range reads | 1174ms | **565ms** | 2734ms | 1992ms | 2564ms | 8431ms |
+| random range reads | 1173ms | **565ms** | 2742ms | 1993ms | 2690ms | 8449ms |
+| random reads (4 threads) | 1390ms | **840ms** | 3995ms | 1913ms | 2606ms | 7000ms |
+| random reads (8 threads) | 757ms | **427ms** | 2147ms | 1019ms | 1352ms | 8123ms |
+| random reads (16 threads) | 652ms | **216ms** | 1478ms | 690ms | 963ms | 23022ms |
+| random reads (32 threads) | 410ms | **125ms** | 1100ms | 444ms | 576ms | 26536ms |
+| removals | 23297ms | 10435ms | 6900ms | 11088ms | **6004ms** | 10323ms |
+| uncompacted size | 4.00 GiB | 2.61 GiB | **893.18 MiB** | 2.13 GiB | 1000.95 MiB | 1.09 GiB |
+| compacted size | 1.69 GiB | 1.26 GiB | **454.71 MiB** | N/A | 1000.95 MiB | 556.85 MiB |
+
+<Note>
+redb excels at individual writes and constant-time `len()`. lmdb leads on random reads and bulk loads. rocksdb and fjall win on compacted storage size and batch write throughput.
+</Note>
+
+## Current status
+
+redb is **stable and actively maintained**. The current release is **4.1.0**. The on-disk file format is stable — future format changes will include an upgrade path. The crate is dual-licensed under MIT and Apache 2.0.
+
+## Explore further
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Write your first redb database in under five minutes
+  </Card>
+  <Card title="Installation" icon="box" href="/installation">
+    Add redb to Cargo.toml and configure optional features
+  </Card>
+  <Card title="Core concepts" icon="book" href="/concepts/databases-and-tables">
+    Understand databases, tables, transactions, and the type system
+  </Card>
+  <Card title="API reference" icon="code" href="/api/database">
+    Full reference for every public type and method
+  </Card>
+</CardGroup>

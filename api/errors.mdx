@@ -1,0 +1,358 @@
+---
+title: "Error types — redb error handling"
+description: "Covers all redb error types: StorageError, DatabaseError, TableError, CommitError, SavepointError, CompactionError, and the top-level Error."
+---
+
+redb uses a structured hierarchy of error enums rather than a single catch-all type. Each operation returns the narrowest error type that describes what can go wrong at that layer — for example, `Table::open` returns `TableError` and `WriteTransaction::commit` returns `CommitError`. The top-level `Error` enum is a superset that all narrower errors convert into via `From`, making it easy to use the `?` operator in functions that mix operations.
+
+## Error handling patterns
+
+The typical pattern is to let `?` convert errors automatically into whatever error type your function returns:
+
+```rust
+use redb::{Database, Error, ReadableTable, TableDefinition};
+
+const TABLE: TableDefinition<&str, u64> = TableDefinition::new("data");
+
+fn read_value(db: &Database, key: &str) -> Result<Option<u64>, Error> {
+    let read_txn = db.begin_read()?;       // DatabaseError -> Error
+    let table = read_txn.open_table(TABLE)?; // TableError -> Error
+    Ok(table.get(key)?.map(|g| g.value()))
+}
+```
+
+When you need to act on specific variants, match on the concrete error type before it is widened:
+
+```rust
+use redb::{Database, DatabaseError};
+
+fn open_db(path: &str) -> Result<Database, DatabaseError> {
+    Database::open(path).or_else(|e| match e {
+        DatabaseError::UpgradeRequired(_) => {
+            eprintln!("database is too old — run the migration tool");
+            Err(e)
+        }
+        other => Err(other),
+    })
+}
+```
+
+<Note>
+All error enums are marked `#[non_exhaustive]`. Always include a catch-all `_` arm when matching so that new variants added in future releases do not break your code.
+</Note>
+
+---
+
+## `Error` — top-level superset
+
+`Error` is a convenience type that encompasses every variant from all narrower error enums. Convert to it freely via `?` or `From`. It is ideal for application code that does not need to distinguish between error layers.
+
+<AccordionGroup>
+  <Accordion title="DatabaseAlreadyOpen">
+    The database file is already locked by another process or another `Database` instance in the same process. redb uses OS file locking to enforce single-writer access.
+  </Accordion>
+
+  <Accordion title="RepairAborted">
+    `RepairSession::abort` was called, or the repair was abandoned because the database was opened read-only. Returned from `Database::open` / `Database::create` when the repair callback aborts.
+  </Accordion>
+
+  <Accordion title="UpgradeRequired(u8)">
+    The on-disk file format version does not match the current library version. The `u8` payload is the actual version found in the file. A manual upgrade step is required before the database can be opened.
+  </Accordion>
+
+  <Accordion title="TransactionInProgress">
+    An operation was attempted (e.g. compaction or closing the database) while a write transaction is still open.
+  </Accordion>
+
+  <Accordion title="Corrupted(String)">
+    The database file has been corrupted. The string contains a human-readable description of the inconsistency detected. This is not recoverable without a repair.
+  </Accordion>
+
+  <Accordion title="InvalidSavepoint">
+    The savepoint is no longer valid — either a prior savepoint was restored after it was created, or a savepoint creation was attempted while the transaction was dirty (had open tables). See `SavepointError::InvalidSavepoint` for more detail.
+  </Accordion>
+
+  <Accordion title="ImmediateDurabilityRequired">
+    The requested savepoint operation (creating or deleting a persistent savepoint, or restoring an older savepoint when newer persistent savepoints exist) requires the current transaction's durability to be `Durability::Immediate`.
+  </Accordion>
+
+  <Accordion title="PersistentSavepointModified">
+    `WriteTransaction::set_durability` was called in a way that would downgrade durability after a persistent savepoint was already created in the transaction.
+  </Accordion>
+
+  <Accordion title="PersistentSavepointExists">
+    A compaction was attempted while a persistent savepoint exists. Remove or restore all persistent savepoints before compacting.
+  </Accordion>
+
+  <Accordion title="EphemeralSavepointExists">
+    A compaction was attempted while an ephemeral savepoint exists. Drop all savepoints before compacting.
+  </Accordion>
+
+  <Accordion title="ValueTooLarge(usize)">
+    The value being inserted exceeds the maximum size of 3 GiB. The `usize` payload is the actual length that was rejected.
+  </Accordion>
+
+  <Accordion title="TableTypeMismatch { table, key, value }">
+    The table named `table` already exists in the database but was created with key type `key` and value type `value`, which differ from the types given in the current `TableDefinition`. The `TypeName` payloads can be printed to show the stored type names.
+  </Accordion>
+
+  <Accordion title="TableIsMultimap(String)">
+    Attempted to open the named table as a regular `Table`, but it was created as a `MultimapTable`.
+  </Accordion>
+
+  <Accordion title="TableIsNotMultimap(String)">
+    Attempted to open the named table as a `MultimapTable`, but it was created as a regular `Table`.
+  </Accordion>
+
+  <Accordion title="TypeDefinitionChanged { name, alignment, width }">
+    The in-memory definition of type `name` (its alignment or fixed width) does not match what was stored when the table was first created. This can happen if a custom `Value` implementation changes layout between runs.
+  </Accordion>
+
+  <Accordion title="TableDoesNotExist(String)">
+    Attempted to open a table that has never been created in this database. Use `open_table` inside a write transaction to create a table on first access.
+  </Accordion>
+
+  <Accordion title="TableExists(String)">
+    Attempted to create a table with a name that already exists in the database.
+  </Accordion>
+
+  <Accordion title="TableAlreadyOpen(String, Location)">
+    The named table is already open for writing in the same transaction. A table can only be opened for writing once at a time to prevent aliased mutable references to dirty pages.
+  </Accordion>
+
+  <Accordion title="Io(io::Error)">
+    An underlying I/O error from the operating system or storage backend. Inspect the wrapped `io::Error` for the OS error code.
+  </Accordion>
+
+  <Accordion title="DatabaseClosed">
+    The `Database` handle has already been closed. No further operations are possible on it.
+  </Accordion>
+
+  <Accordion title="PreviousIo">
+    A prior I/O error left the database in an inconsistent in-memory state. The database must be closed and re-opened before any further operations can be attempted.
+  </Accordion>
+
+  <Accordion title="LockPoisoned(Location)">
+    An internal `Mutex` was poisoned because a thread panicked while holding it. The `Location` indicates the source location where the poison was detected. The database should be closed.
+  </Accordion>
+
+  <Accordion title="ReadTransactionStillInUse(Box<ReadTransaction>)">
+    `ReadTransaction::close` was called but a table or iterator derived from the transaction is still live. The `ReadTransaction` is returned inside the error so the caller can keep it alive until the dependent objects are dropped.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## `StorageError`
+
+`StorageError` represents low-level errors from the storage layer. It is returned directly by internal routines and wraps into `Error` via `From<StorageError> for Error`.
+
+<AccordionGroup>
+  <Accordion title="Corrupted(String)">
+    The database file contains structurally invalid data. The string describes what was found. This is usually not recoverable without the repair API.
+  </Accordion>
+
+  <Accordion title="ValueTooLarge(usize)">
+    A value exceeded the 3 GiB per-value limit. The `usize` is the rejected byte length.
+  </Accordion>
+
+  <Accordion title="Io(io::Error)">
+    An OS-level I/O error. Check the wrapped `io::Error` for `ErrorKind` and OS error code.
+  </Accordion>
+
+  <Accordion title="PreviousIo">
+    A prior I/O error occurred. The database is in an undefined state and must be closed and re-opened.
+  </Accordion>
+
+  <Accordion title="DatabaseClosed">
+    The database handle has been closed and can no longer be used.
+  </Accordion>
+
+  <Accordion title="LockPoisoned(Location)">
+    An internal mutex was poisoned by a panicking thread. The `Location` identifies the source site. Close the database.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## `DatabaseError`
+
+`DatabaseError` is returned by `Database::open`, `Database::create`, and related database-level operations.
+
+<AccordionGroup>
+  <Accordion title="DatabaseAlreadyOpen">
+    The database file is already locked. Only one `Database` instance may hold the file lock at a time.
+  </Accordion>
+
+  <Accordion title="RepairAborted">
+    The repair callback returned `RepairSession::abort`, or repair was not possible because the file was opened read-only.
+  </Accordion>
+
+  <Accordion title="UpgradeRequired(u8)">
+    The file's format version (the `u8` payload) is older than the current library's expected version. Run the upgrade tool or use a library version that supports the old format.
+  </Accordion>
+
+  <Accordion title="TransactionInProgress">
+    The operation requires exclusive access but a write transaction is still open.
+  </Accordion>
+
+  <Accordion title="Storage(StorageError)">
+    A lower-level storage error occurred during database initialization.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## `TableError`
+
+`TableError` is returned by `WriteTransaction::open_table`, `ReadTransaction::open_table`, and related table-open methods.
+
+<AccordionGroup>
+  <Accordion title="TableTypeMismatch { table, key, value }">
+    The existing table was created with key type `key` and value type `value`, which differ from the type parameters supplied in the current call. The `TypeName` payloads are human-readable type identifiers.
+  </Accordion>
+
+  <Accordion title="TableIsMultimap(String)">
+    Attempted to open a multimap table as a regular `Table`.
+  </Accordion>
+
+  <Accordion title="TableIsNotMultimap(String)">
+    Attempted to open a regular table as a `MultimapTable`.
+  </Accordion>
+
+  <Accordion title="TypeDefinitionChanged { name, alignment, width }">
+    The runtime definition of a custom type (alignment or fixed width) has changed since the table was first created.
+  </Accordion>
+
+  <Accordion title="TableDoesNotExist(String)">
+    No table with the given name exists in the database. Open it inside a write transaction to create it.
+  </Accordion>
+
+  <Accordion title="TableExists(String)">
+    A table with the given name already exists.
+  </Accordion>
+
+  <Accordion title="TableAlreadyOpen(String, Location)">
+    The table is already open for writing in this transaction. Close the existing handle before opening it again.
+  </Accordion>
+
+  <Accordion title="Storage(StorageError)">
+    A storage-layer error occurred while opening the table.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## `TransactionError`
+
+`TransactionError` is returned by `ReadTransaction::close`.
+
+<AccordionGroup>
+  <Accordion title="ReadTransactionStillInUse(Box<ReadTransaction>)">
+    The transaction cannot be closed because a table, range, or other object derived from it is still alive. The `ReadTransaction` is returned in the error payload; hold onto it and retry `close` after dropping the dependent objects.
+
+    ```rust
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(TABLE)?;
+    // table must be dropped before close succeeds
+    drop(table);
+    read_txn.close()?;
+    ```
+  </Accordion>
+
+  <Accordion title="Storage(StorageError)">
+    A storage error occurred while closing the transaction.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## `CommitError`
+
+`CommitError` is returned by `WriteTransaction::commit`.
+
+<AccordionGroup>
+  <Accordion title="Storage(StorageError)">
+    A storage-layer error occurred during the commit. The transaction has been rolled back. The database is in a consistent state and can continue to be used unless the inner error is `StorageError::PreviousIo`.
+  </Accordion>
+</AccordionGroup>
+
+<Warning>
+If `commit` returns `CommitError::Storage(StorageError::PreviousIo)`, or if `commit` returns `Io`, the database must be closed and re-opened. Any subsequent operations on the current `Database` handle will also fail.
+</Warning>
+
+---
+
+## `SavepointError`
+
+`SavepointError` is returned by savepoint creation, restoration, and deletion methods on `WriteTransaction`.
+
+<AccordionGroup>
+  <Accordion title="InvalidSavepoint">
+    The savepoint is no longer usable. This happens in two situations:
+    - An older savepoint was restored *after* this savepoint was created, making this one unreachable.
+    - A savepoint creation was attempted while the transaction was "dirty" — i.e., one or more tables had already been opened in the transaction.
+  </Accordion>
+
+  <Accordion title="ImmediateDurabilityRequired">
+    The operation requires that the current transaction's durability level be `Durability::Immediate`. Affected operations include creating a persistent savepoint, deleting a persistent savepoint, and restoring an older savepoint when newer persistent savepoints would need to be deleted.
+  </Accordion>
+
+  <Accordion title="Storage(StorageError)">
+    A storage error occurred during the savepoint operation.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## `CompactionError`
+
+`CompactionError` is returned by `Database::compact`.
+
+<AccordionGroup>
+  <Accordion title="PersistentSavepointExists">
+    Compaction cannot proceed while a persistent savepoint exists. Delete all persistent savepoints first.
+  </Accordion>
+
+  <Accordion title="EphemeralSavepointExists">
+    Compaction cannot proceed while an ephemeral savepoint is held. Drop all savepoints before calling `compact`.
+  </Accordion>
+
+  <Accordion title="TransactionInProgress">
+    Compaction requires exclusive access; a write transaction is still open.
+  </Accordion>
+
+  <Accordion title="Storage(StorageError)">
+    A storage error occurred during compaction.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## `SetDurabilityError`
+
+`SetDurabilityError` is returned by `WriteTransaction::set_durability`.
+
+<AccordionGroup>
+  <Accordion title="PersistentSavepointModified">
+    The transaction already created or modified a persistent savepoint with a higher durability level. Downgrading the transaction's durability at this point would leave the persistent savepoint in an inconsistent state, so the operation is rejected.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Error conversion map
+
+The following table summarises which narrow error type each top-level API returns and how they widen to `Error`.
+
+| Operation | Returned error | Widens to `Error` via |
+|-----------|---------------|----------------------|
+| `Database::open` / `::create` | `DatabaseError` | `From<DatabaseError>` |
+| `WriteTransaction::open_table` | `TableError` | `From<TableError>` |
+| `ReadTransaction::open_table` | `TableError` | `From<TableError>` |
+| `WriteTransaction::commit` | `CommitError` | `From<CommitError>` |
+| `ReadTransaction::close` | `TransactionError` | `From<TransactionError>` |
+| `WriteTransaction::set_durability` | `SetDurabilityError` | `From<SetDurabilityError>` |
+| Savepoint methods | `SavepointError` | `From<SavepointError>` |
+| `Database::compact` | `CompactionError` | `From<CompactionError>` |
+| Storage internals | `StorageError` | `From<StorageError>` |

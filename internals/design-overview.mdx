@@ -1,0 +1,74 @@
+---
+title: "redb architecture and design overview"
+description: "Explore redb's copy-on-write B-tree storage model, MVCC isolation, page-based regions, and epoch-based page reclamation under the hood."
+---
+
+redb is a pure-Rust, ACID-compliant embedded key-value store built around a small set of orthogonal primitives: copy-on-write B-trees, multi-version concurrency control (MVCC), and a page-based file layout divided into regions. Understanding how these pieces fit together helps both users who want to reason about performance characteristics and contributors who plan to modify the storage layer.
+
+## The three B-trees
+
+Every redb database file contains exactly three logical B-tree structures, plus one B-tree per user-defined table:
+
+| Tree | Purpose |
+|---|---|
+| **Table tree** (user root) | Maps table names to their definitions. This is the root of everything a user can see. |
+| **System tree** (system root) | Stores internal bookkeeping: savepoints, allocator state snapshots, freed-page accounting. |
+| **Data tree(s)** | One per user table — stores the actual key → value pairs, providing the same interface as a `BTreeMap`. |
+
+In file format v3, pending free pages are tracked in two system tables (one for the data tree, one for the system tree) rather than a separate freed tree. The "allocated pages" system table also tracks pages allocated by each transaction when a savepoint is live.
+
+All of these trees, except the database super-header, are **copy-on-write**. A write transaction never modifies a page in place once it has been committed; it always allocates a new page, writes the modified content there, and rebuilds the path from leaf to root. This design is what makes MVCC, crash safety, and savepoints all possible with a simple mental model.
+
+## Copy-on-write B-trees and why they matter
+
+The copy-on-write property means that any committed snapshot of the database is immutable from the moment the commit lands. A read transaction simply captures the root page number at the time it begins, and that snapshot remains stable no matter what write transactions do afterward. No locks are needed between readers and writers.
+
+The trade-off is write amplification: every write touches O(log N) pages from the modified leaf up to the root. For workloads that do many small writes this is visible, but for typical embedded database usage the predictability and simplicity of the model outweigh the cost.
+
+## Page-based storage and regions
+
+The file is divided into one or more **regions**. Each region has a small header (containing the allocator state) followed by a contiguous block of data pages. Regions allow the file to grow efficiently: instead of a single flat address space, redb appends new regions as the database expands.
+
+Pages have a base size (defaulting to the OS page size) and are allocated in **power-of-two multiples** of that base size (called "orders"). The regional allocator is a **buddy allocator** backed by a `BtreeBitmap` (a 64-way tree of free-page indicators) and a `U64GroupedBitmap` for tracking allocation order. This lets redb serve large values — which need multi-page allocations — efficiently alongside small ones.
+
+A 512-byte **super-header** sits at the very beginning of the file. It holds immutable configuration (page size, region size) and two double-buffered **commit slots** whose active copy is selected by a single "god byte". See the [file format reference](/internals/file-format) for the exact byte layout.
+
+## MVCC implementation
+
+redb provides a single isolation level: **serializable**. There is exactly one writer at a time, and writes are applied sequentially. Multiple readers can run concurrently with the writer, and with each other, without any blocking.
+
+When a write transaction frees a page it does not immediately return it to the free pool. Instead the page is placed in the **freed tree** (or the corresponding system table in v3) keyed by the transaction ID of the freeing transaction. The page is only reclaimed once all read transactions that could be referencing it have completed. This is the **epoch-based reclamation** mechanism described below.
+
+Read transactions register themselves so that the write path knows the earliest live snapshot. When the last reader holding a reference to a given epoch completes, the pages freed at that epoch become eligible for reuse.
+
+### Epoch-based reclamation in detail
+
+Every page in the system is in one of these states:
+
+- **Dirty** — allocated by an in-progress write transaction; may be modified in-place or freed immediately on abort.
+- **Committed** — allocated by a committed transaction; never modified in-place.
+- **Pending free** — committed page that is no longer reachable from any live data or system tree root, but may still be referenced by an active read transaction.
+- **Orphaned / Reclaimed** — the transaction that freed the page is no longer referenced by any reader; the page has been returned to the allocator.
+
+The key invariant is: **committed pages are never modified in-place, and they may only transition to pending-free after all readers that could reference them have finished.** This, combined with monotonically increasing transaction IDs, ensures that a page pointer always points into the same or an earlier transaction's data — making the checksum-based integrity verification in the commit path reliable.
+
+## Savepoints
+
+Savepoints are built on top of the same MVCC structures. Creating a savepoint registers it as a read transaction (preventing reclamation of pages it references) and saves a compact snapshot of the page allocator state (roughly 64 KiB per 1 GiB of values at a 4 KiB page size).
+
+Rolling back to a savepoint restores the data tree root and then diffs the saved allocator state against the current one to find pages allocated since the savepoint — these are queued for freeing, completing the rollback without a full file scan.
+
+Savepoints come in two flavours:
+
+- **Ephemeral** — held in memory, freed when dropped.
+- **Persistent** — written into the system table tree, surviving restarts. Must be explicitly deallocated.
+
+## Crash safety and assumptions about the filesystem
+
+redb is designed to survive power loss and misbehaving storage media. It makes only three assumptions:
+
+1. **Single-byte writes are atomic** — each byte is either written completely or not at all.
+2. **`fsync` makes writes durable** — after a successful `fsync`, data is on stable storage.
+3. **Powersafe overwrite** — a write to a byte range does not corrupt bytes outside that range, even if the write is interrupted by a crash. (SQLite makes the same assumption in all modern versions.)
+
+These minimal assumptions are what allow the 1PC+checksum commit strategy to work correctly. See the [commit strategies page](/internals/commit-strategies) for the full correctness analysis.

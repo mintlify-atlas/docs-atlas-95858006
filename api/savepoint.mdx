@@ -1,0 +1,320 @@
+---
+title: "Savepoint — snapshot and rollback API"
+description: "Reference for redb Savepoint: ephemeral and persistent savepoint creation, restoring database state, invalidation rules, and SavepointError variants."
+---
+
+A `Savepoint` captures the state of the database at a specific moment within a `WriteTransaction` and can be used to roll the transaction back to that state. redb supports two kinds of savepoints: **ephemeral** savepoints that live only as long as their Rust value, and **persistent** savepoints that are written to disk and survive across transaction boundaries. Both kinds are created through methods on `WriteTransaction` and restored via `WriteTransaction::restore_savepoint`.
+
+<Warning>
+While any savepoint is alive — ephemeral or persistent — pages that become unreachable after the savepoint was created are retained and cannot be freed. This can cause the database file to grow. Minimize the lifetime of savepoints and delete persistent savepoints as soon as they are no longer needed.
+</Warning>
+
+---
+
+## The `Savepoint` type
+
+`Savepoint` is an opaque struct defined in the `redb` crate. It cannot be constructed directly; you always obtain one from `WriteTransaction`. Internally, a `Savepoint` records:
+
+- A savepoint ID (monotonically increasing within the database).
+- A transaction ID pinning the page versions that were live when the savepoint was taken.
+- The root of the user B-tree at the moment of the snapshot.
+- Whether the savepoint is ephemeral or persistent.
+
+```rust
+pub struct Savepoint { /* opaque */ }
+```
+
+Ephemeral `Savepoint` values implement `Drop`: when the value is dropped, the associated transaction pin is released and page reclamation can resume.
+
+---
+
+## Ephemeral savepoints
+
+An ephemeral savepoint lives in memory for as long as the `Savepoint` Rust value is alive. Dropping the value immediately frees all resources held by the savepoint. This makes ephemeral savepoints suitable for transient rollback points within a single transaction.
+
+### `WriteTransaction::ephemeral_savepoint`
+
+```rust
+pub fn ephemeral_savepoint(&self) -> Result<Savepoint, SavepointError>
+```
+
+Creates an in-memory savepoint of the current database state.
+
+**Precondition:** The transaction must be "clean" — no tables may have been opened yet. Opening a table marks the transaction as dirty and prevents savepoint creation.
+
+**Errors**
+
+| Variant | Cause |
+|---|---|
+| `SavepointError::InvalidSavepoint` | The transaction is dirty (at least one table has been opened). |
+| `SavepointError::Storage` | Underlying storage error. |
+
+```rust
+let db = Database::create("my.db")?;
+let mut txn = db.begin_write()?;
+
+// Snapshot before any writes
+let sp = txn.ephemeral_savepoint()?;
+
+// Make some writes
+{
+    let mut table = txn.open_table(USERS)?;
+    table.insert(&1, "alice")?;
+}
+
+// Something went wrong — undo everything
+txn.restore_savepoint(&sp)?;
+// sp is dropped here; pages are freed
+drop(sp);
+
+txn.commit()?; // Commits the rolled-back state (empty)
+```
+
+---
+
+## Persistent savepoints
+
+A persistent savepoint is written to a system table inside the database file. It survives `commit()` and can be retrieved by ID in a future `WriteTransaction`. This makes persistent savepoints suitable for application-level checkpoints — for example, before a schema migration.
+
+### `WriteTransaction::persistent_savepoint`
+
+```rust
+pub fn persistent_savepoint(&self) -> Result<u64, SavepointError>
+```
+
+Creates a durable savepoint and returns its numeric ID. The ID is stable and unique within the database; IDs are never reused.
+
+**Precondition:** The transaction must be clean (no tables opened) and must have `Durability::Immediate` (the default).
+
+**Errors**
+
+| Variant | Cause |
+|---|---|
+| `SavepointError::InvalidSavepoint` | The transaction is dirty. |
+| `SavepointError::ImmediateDurabilityRequired` | Transaction durability is less than `Durability::Immediate`. |
+| `SavepointError::Storage` | Underlying storage error. |
+
+```rust
+// Create a checkpoint before a risky migration
+let mut txn = db.begin_write()?;
+let checkpoint_id = txn.persistent_savepoint()?;
+txn.commit()?;
+
+// The savepoint is now on disk
+println!("checkpoint id = {checkpoint_id}");
+```
+
+### `WriteTransaction::get_persistent_savepoint`
+
+```rust
+pub fn get_persistent_savepoint(&self, id: u64) -> Result<Savepoint, SavepointError>
+```
+
+Retrieves a persistent savepoint by its numeric ID, returning a `Savepoint` that can be passed to `restore_savepoint`.
+
+<ParamField path="id" type="u64" required>
+  The ID previously returned by `persistent_savepoint`.
+</ParamField>
+
+**Errors** — `SavepointError::InvalidSavepoint` if no savepoint with that ID exists.
+
+```rust
+let mut txn = db.begin_write()?;
+let sp = txn.get_persistent_savepoint(checkpoint_id)?;
+txn.restore_savepoint(&sp)?;
+txn.commit()?;
+```
+
+### `WriteTransaction::list_persistent_savepoints`
+
+```rust
+pub fn list_persistent_savepoints(&self) -> Result<impl Iterator<Item = u64>>
+```
+
+Returns an iterator over the IDs of all persistent savepoints currently stored in the database, in ascending order.
+
+```rust
+let txn = db.begin_write()?;
+for id in txn.list_persistent_savepoints()? {
+    println!("persistent savepoint: {id}");
+}
+txn.abort()?;
+```
+
+### `WriteTransaction::delete_persistent_savepoint`
+
+```rust
+pub fn delete_persistent_savepoint(&self, id: u64) -> Result<bool, SavepointError>
+```
+
+Deletes a persistent savepoint. Returns `true` if the savepoint existed, `false` if it did not. If the enclosing transaction is aborted, the deletion is rolled back and the savepoint is restored.
+
+<ParamField path="id" type="u64" required>
+  The savepoint ID to delete.
+</ParamField>
+
+**Errors**
+
+| Variant | Cause |
+|---|---|
+| `SavepointError::ImmediateDurabilityRequired` | Durability is less than `Immediate`. |
+| `SavepointError::Storage` | Underlying storage error. |
+
+```rust
+let txn = db.begin_write()?;
+let deleted = txn.delete_persistent_savepoint(checkpoint_id)?;
+assert!(deleted);
+txn.commit()?; // Deletion is now durable
+```
+
+---
+
+## Restoring a savepoint
+
+### `WriteTransaction::restore_savepoint`
+
+```rust
+pub fn restore_savepoint(&mut self, savepoint: &Savepoint) -> Result<(), SavepointError>
+```
+
+Rolls the transaction's B-tree root back to the state captured in `savepoint`. Pages allocated since the savepoint was taken are freed. All savepoints created after `savepoint` are invalidated.
+
+After restoring, you can continue writing as if the rollback never happened. The restore itself is not committed until you call `commit()`.
+
+<ParamField path="savepoint" type="&Savepoint" required>
+  A `Savepoint` obtained from `ephemeral_savepoint` or `get_persistent_savepoint`. Must belong to the same `Database` instance.
+</ParamField>
+
+**Errors**
+
+| Variant | Cause |
+|---|---|
+| `SavepointError::InvalidSavepoint` | The savepoint is from a different database, or has already been invalidated by an earlier `restore_savepoint` call. |
+| `SavepointError::ImmediateDurabilityRequired` | Newer persistent savepoints exist that would need to be deleted, but durability is not `Immediate`. |
+| `SavepointError::Storage` | Underlying storage error. |
+
+```rust
+let mut txn = db.begin_write()?;
+
+let sp1 = txn.ephemeral_savepoint()?;
+
+{
+    let mut t = txn.open_table(USERS)?;
+    t.insert(&1, "alice")?;
+}
+
+let sp2 = txn.ephemeral_savepoint()?; // dirty -> error if attempted here
+
+// Restore to sp1 — this invalidates sp2
+txn.restore_savepoint(&sp1)?;
+
+// sp2 is now invalid
+// txn.restore_savepoint(&sp2)?; // would return SavepointError::InvalidSavepoint
+
+txn.commit()?;
+```
+
+---
+
+## Savepoint invalidation rules
+
+A savepoint becomes invalid when any of the following occur:
+
+1. **An older savepoint is restored.** `restore_savepoint(&older_sp)` invalidates all savepoints created after `older_sp`, including any ephemeral savepoints still held by the caller.
+2. **The savepoint belongs to a different database.** Passing a `Savepoint` from a different `Database` instance is detected at runtime and returns `SavepointError::InvalidSavepoint`.
+3. **A persistent savepoint is deleted.** Calling `delete_persistent_savepoint(id)` removes the on-disk record; any `Savepoint` value previously obtained via `get_persistent_savepoint(id)` is no longer usable.
+
+Attempting to restore an invalid savepoint returns `SavepointError::InvalidSavepoint` rather than silently corrupting the database.
+
+---
+
+## `SavepointError` variants
+
+`SavepointError` is the error type returned by all savepoint-related operations.
+
+```rust
+#[non_exhaustive]
+pub enum SavepointError {
+    InvalidSavepoint,
+    ImmediateDurabilityRequired,
+    Storage(StorageError),
+}
+```
+
+| Variant | Description |
+|---|---|
+| `InvalidSavepoint` | The savepoint cannot be created or used. Either the transaction is dirty (has open tables), the savepoint was invalidated by a prior `restore_savepoint` call, or it belongs to a different database. |
+| `ImmediateDurabilityRequired` | The operation requires the transaction to use `Durability::Immediate`. This is returned when creating or deleting a persistent savepoint, or when restoring a savepoint while newer persistent savepoints would need to be implicitly deleted. |
+| `Storage(StorageError)` | An I/O or corruption error from the underlying storage layer. |
+
+`SavepointError` converts into the top-level `Error` enum for convenience:
+
+```rust
+use redb::{Database, SavepointError, TableDefinition};
+
+const T: TableDefinition<u64, u64> = TableDefinition::new("t");
+
+fn maybe_rollback(db: &Database) -> Result<(), redb::Error> {
+    let mut txn = db.begin_write()?;
+    let sp = txn.ephemeral_savepoint()?; // SavepointError -> Error via From
+
+    {
+        let mut table = txn.open_table(T)?;
+        table.insert(&0, &42)?;
+    }
+
+    txn.restore_savepoint(&sp)?;
+    txn.commit()?;
+    Ok(())
+}
+```
+
+---
+
+## Complete example: persistent checkpoint and rollback
+
+```rust
+use redb::{Database, Durability, TableDefinition};
+
+const DATA: TableDefinition<u64, &str> = TableDefinition::new("data");
+
+fn main() -> Result<(), redb::Error> {
+    let db = Database::create("my.db")?;
+
+    // Step 1: populate some data
+    let txn = db.begin_write()?;
+    {
+        let mut t = txn.open_table(DATA)?;
+        t.insert(&1, "initial")?;
+    }
+    txn.commit()?;
+
+    // Step 2: create a persistent checkpoint
+    let txn = db.begin_write()?;
+    let checkpoint = txn.persistent_savepoint()?;
+    txn.commit()?;
+
+    // Step 3: make more writes
+    let txn = db.begin_write()?;
+    {
+        let mut t = txn.open_table(DATA)?;
+        t.insert(&2, "new data")?;
+    }
+    txn.commit()?;
+
+    // Step 4: roll back to the checkpoint
+    let mut txn = db.begin_write()?;
+    let sp = txn.get_persistent_savepoint(checkpoint)?;
+    txn.restore_savepoint(&sp)?;
+    // Clean up the savepoint now that we've used it
+    txn.delete_persistent_savepoint(checkpoint)?;
+    txn.commit()?;
+
+    // Verify: key 2 no longer exists
+    let read_txn = db.begin_read()?;
+    let t = read_txn.open_table(DATA)?;
+    assert!(t.get(&2)?.is_none());
+
+    Ok(())
+}
+```

@@ -1,0 +1,165 @@
+---
+title: "Installing redb and configuring features"
+description: "Add redb to a Cargo project, enable optional features for logging and cache metrics, meet the minimum Rust version, and use redb-derive for custom types."
+---
+
+Adding redb to a Rust project is a single line in `Cargo.toml`. This page covers the basic dependency declaration, the two optional Cargo features (`logging` and `cache_metrics`), the minimum supported Rust version, notes on WASI targets, and the companion `redb-derive` crate for custom type derive macros.
+
+## Adding the dependency
+
+Add redb to your `[dependencies]` section:
+
+```toml Cargo.toml
+[dependencies]
+redb = "4"
+```
+
+To pin to a specific patch version, use the full version string:
+
+```toml Cargo.toml
+[dependencies]
+redb = "4.1.0"
+```
+
+Then run `cargo build` or `cargo fetch` to download and compile the crate.
+
+<Note>
+redb has no required runtime dependencies beyond the Rust standard library. It does not link against any C or C++ libraries.
+</Note>
+
+## Minimum supported Rust version
+
+redb requires **Rust 1.89** or later. The minimum version is declared in the workspace `Cargo.toml` via the `rust-version` field and is enforced at compile time.
+
+If you are on an older toolchain, update with:
+
+```bash
+rustup update stable
+```
+
+## Optional features
+
+redb ships two opt-in Cargo features. Neither is enabled by default.
+
+### `logging`
+
+Enables structured log output via the [`log`](https://docs.rs/log) crate. When active, redb emits `debug`, `info`, and `warn` messages for significant events such as database opens, transaction commits, and crash recovery.
+
+To use it, enable the feature and add a log implementation (such as `env_logger`) to your project:
+
+```toml Cargo.toml
+[dependencies]
+redb = { version = "4", features = ["logging"] }
+env_logger = "0.11"
+```
+
+Then initialise the logger in your application:
+
+```rust main.rs
+fn main() {
+    env_logger::init();
+    // redb will now emit log messages
+}
+```
+
+### `cache_metrics`
+
+Enables tracking of page cache hit and miss counts. When active, `Database::cache_stats()` returns a `CacheStats` struct with hit and miss counters that you can use to tune the cache size.
+
+```toml Cargo.toml
+[dependencies]
+redb = { version = "4", features = ["cache_metrics"] }
+```
+
+```rust cache_metrics.rs
+use redb::{Database, ReadableDatabase};
+
+let db = Database::create("my_db.redb")?;
+// ... perform reads and writes ...
+let stats = db.cache_stats();
+println!("read hits: {}, read misses: {}", stats.read_hits(), stats.read_misses());
+println!("write hits: {}, write misses: {}", stats.write_hits(), stats.write_misses());
+println!("evictions: {}, used bytes: {}", stats.evictions(), stats.used_bytes());
+```
+
+<Note>
+`cache_metrics` adds a small overhead to every page access. Enable it in development or staging environments to profile cache behaviour, but consider disabling it in production unless you need live metrics.
+</Note>
+
+### Enabling both features
+
+```toml Cargo.toml
+[dependencies]
+redb = { version = "4", features = ["logging", "cache_metrics"] }
+```
+
+## WASI target notes
+
+redb compiles for `wasm32-wasip1` and `wasm32-wasip2` targets. On WASI, the `libc` crate is pulled in as an additional dependency to satisfy platform-specific I/O requirements. No special configuration is needed in your `Cargo.toml` — the dependency is added automatically via a `cfg` target guard in redb's own manifest.
+
+<Warning>
+When creating temporary files on WASI, the directory `/tmp` must exist and be writable. Some WASI runtimes mount a writable `/tmp` by default; others require explicit configuration.
+</Warning>
+
+## The `redb-derive` crate
+
+`redb-derive` is a companion crate that provides derive macros for implementing redb's `Key` and `Value` traits on your own types. This lets you use custom Rust structs and enums directly as table keys or values without writing the trait implementations by hand.
+
+```toml Cargo.toml
+[dependencies]
+redb = "4"
+redb-derive = "4"
+```
+
+Basic usage:
+
+```rust custom_types.rs
+use redb::TableDefinition;
+use redb_derive::Value;
+
+#[derive(Value, Debug)]
+struct UserId {
+    namespace: u32,
+    id: u64,
+}
+
+const USERS: TableDefinition<u64, UserId> = TableDefinition::new("users");
+```
+
+<Tip>
+`redb-derive` is versioned alongside the main `redb` crate. Always use matching major versions — `redb = "4"` with `redb-derive = "4"`.
+</Tip>
+
+## Complete example manifest
+
+A `Cargo.toml` for a project using redb with all optional features and the derive crate:
+
+```toml Cargo.toml
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+
+[dependencies]
+redb = { version = "4", features = ["logging", "cache_metrics"] }
+redb-derive = "4"
+env_logger = "0.11"
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Write your first redb database in under five minutes
+  </Card>
+  <Card title="Custom types" icon="wrench" href="/guides/custom-types">
+    Implement Key and Value for your own structs
+  </Card>
+  <Card title="Custom backends" icon="plug" href="/guides/custom-backends">
+    Replace the file backend with your own storage layer
+  </Card>
+  <Card title="API reference" icon="code" href="/api/database">
+    Full reference for every public type and method
+  </Card>
+</CardGroup>

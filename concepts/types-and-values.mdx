@@ -1,0 +1,173 @@
+---
+title: "redb type system: Value, Key, and built-in types"
+description: "Explore redb's Value, Key, and MutInPlaceValue traits, the full set of built-in types, TypeName-based runtime checking, and zero-copy AccessGuard reads."
+---
+
+redb is a strongly typed key-value store. Rather than working with raw byte slices, you declare the exact Rust types for each table's keys and values. This page describes the three core traits—`Value`, `Key`, and `MutInPlaceValue`—lists every built-in type that implements them, explains how `TypeName` enables runtime type checking, and shows how `AccessGuard` gives zero-copy read access to stored data.
+
+## The Value trait
+
+Every type that can be stored in a redb table must implement `Value`. The trait defines how a Rust value is serialized to bytes and deserialized back:
+
+```rust
+pub trait Value: Debug {
+    // The concrete type returned by from_bytes, which may borrow from the stored bytes
+    type SelfType<'a>: Debug + 'a where Self: 'a;
+
+    // The serialized byte representation
+    type AsBytes<'a>: AsRef<[u8]> + 'a where Self: 'a;
+
+    // None for variable-width types, Some(n) for fixed-width types
+    fn fixed_width() -> Option<usize>;
+
+    // Deserialize bytes. May return a zero-copy view (e.g. &[u8], &str)
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a> where Self: 'a;
+
+    // Serialize a value to bytes
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a> where Self: 'b;
+
+    // Globally unique identifier used for runtime type checking
+    fn type_name() -> TypeName;
+}
+```
+
+The `SelfType<'a>` associated type is what makes zero-copy possible. For `&[u8]`, `SelfType<'a>` is `&'a [u8]`, so redb can return a direct reference into the memory-mapped page rather than copying the bytes into a new allocation. For owned types like `String`, `SelfType<'a>` is `String`, and a copy is made.
+
+## The Key trait
+
+`Key` extends `Value` with a total ordering over the serialized byte representation. This ordering determines the iteration order of the B-tree:
+
+```rust
+pub trait Key: Value {
+    fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering;
+}
+```
+
+Only types that implement `Key` can be used as table keys. All built-in numeric types use little-endian byte ordering, and their `Key::compare` implementations delegate to the natural numeric ordering of the type. Strings use lexicographic byte comparison (which matches Unicode code-point order for UTF-8).
+
+<Note>
+`Key` is also required for both key and value types of multimap tables, because the values inside a multimap are themselves stored in a sorted B-tree subtree.
+</Note>
+
+## The MutInPlaceValue trait
+
+`MutInPlaceValue` is a refinement of `Value` for types whose serialized form can be mutated as a `&mut [u8]` without round-tripping through `from_bytes`/`as_bytes`. Implementing it unlocks `Table::insert_reserve`, which allocates space in the B-tree for a value and returns a mutable reference to that space, avoiding an extra copy for large values:
+
+```rust
+// Reserve 1024 bytes for key 42, then fill them in-place
+let mut guard = table.insert_reserve(&42, 1024)?;
+guard.as_mut().fill(0xFF);
+```
+
+The only built-in type that implements `MutInPlaceValue` is `&[u8]`. Custom types can implement it when their encoding is a plain byte array.
+
+## Built-in types
+
+redb ships with `Value` (and usually `Key`) implementations for a wide range of standard Rust types. All numeric types are encoded in little-endian byte order.
+
+### Types implementing both Value and Key
+
+| Rust type | Notes |
+|-----------|-------|
+| `u8`, `u16`, `u32`, `u64`, `u128` | Fixed-width unsigned integers |
+| `i8`, `i16`, `i32`, `i64`, `i128` | Fixed-width signed integers |
+| `bool` | 1 byte: `0` for `false`, `1` for `true` |
+| `char` | 3 bytes (Unicode scalar, little-endian `u32` truncated) |
+| `&str` | Variable-width, zero-copy; sorted lexicographically |
+| `String` | Variable-width, owned; sorted lexicographically |
+| `&[u8]` | Variable-width, zero-copy byte slice |
+| `&[u8; N]` | Fixed-width byte array reference |
+| `[u8; N]` | Fixed-width owned byte array |
+| `[T; N]` where `T: Key` | Fixed-width if `T` is fixed-width, variable otherwise |
+| `Option<T>` where `T: Key` | `None` sorts before `Some(_)` |
+| `()` | Zero bytes; useful as a set-like value |
+
+### Types implementing Value only (not Key)
+
+| Rust type | Notes |
+|-----------|-------|
+| `f32` | 4-byte little-endian IEEE 754; no `Key` because NaN breaks total ordering |
+| `f64` | 8-byte little-endian IEEE 754; no `Key` for the same reason |
+
+### Optional feature-gated types
+
+When the `chrono_v0_4` feature is enabled, `chrono::DateTime<Utc>` and related types implement `Value`. When the `uuid` feature is enabled, `uuid::Uuid` implements both `Value` and `Key`.
+
+## TypeName and runtime type checking
+
+Every `Value` implementation returns a `TypeName` from `Value::type_name()`. redb stores this name alongside each table's metadata. When you call `open_table` (or `open_multimap_table`), redb compares the stored `TypeName` with the one derived from the `TableDefinition` you pass in. A mismatch returns `TableError::TableTypeMismatch` immediately.
+
+For user-defined types you create a `TypeName` with `TypeName::new`:
+
+```rust
+use redb::TypeName;
+
+fn type_name() -> TypeName {
+    TypeName::new("my_crate::MyType")
+}
+```
+
+It is recommended to prefix the name with the crate name to reduce the chance of collisions when different crates define types with similar names.
+
+<Warning>
+If you rename a user-defined type or change its `TypeName` string, existing databases will no longer be able to open tables that use that type. Treat the `TypeName` string as part of your public API and migration strategy.
+</Warning>
+
+## Custom types with bincode
+
+You can store any serializable type by wrapping it in a newtype that implements `Value` (and optionally `Key`). The following example from the redb repository uses `bincode`:
+
+```rust
+use std::any::type_name;
+use std::cmp::Ordering;
+use bincode::{Decode, Encode, decode_from_slice, encode_to_vec};
+use redb::{Key, TypeName, Value};
+
+#[derive(Debug)]
+pub struct Bincode<T>(pub T);
+
+impl<T: std::fmt::Debug + Encode + Decode<()>> Value for Bincode<T> {
+    type SelfType<'a> = T where Self: 'a;
+    type AsBytes<'a> = Vec<u8> where Self: 'a;
+
+    fn fixed_width() -> Option<usize> { None }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> T where Self: 'a {
+        decode_from_slice(data, bincode::config::standard()).unwrap().0
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a T) -> Vec<u8> where Self: 'b {
+        encode_to_vec(value, bincode::config::standard()).unwrap()
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::new(&format!("Bincode<{}>", type_name::<T>()))
+    }
+}
+
+impl<T: std::fmt::Debug + Decode<()> + Encode + Ord> Key for Bincode<T> {
+    fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
+        Self::from_bytes(data1).cmp(&Self::from_bytes(data2))
+    }
+}
+```
+
+## Zero-copy reads with AccessGuard
+
+`get` and range iteration return `AccessGuard<'_, V>` rather than an owned value. `AccessGuard` borrows from the memory-mapped storage page and exposes the value through `.value()`, which returns `V::SelfType<'_>`. For zero-copy types like `&[u8]` and `&str`, this means the returned reference points directly into the mapped page—no heap allocation:
+
+```rust
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+
+const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blobs");
+
+fn read_blob(db: &Database, key: &str) -> Result<Option<Vec<u8>>, redb::Error> {
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(TABLE)?;
+
+    // guard.value() is &[u8] — a zero-copy view into the storage page
+    Ok(table.get(key)?.map(|guard| guard.value().to_vec()))
+}
+```
+
+`AccessGuard` keeps a reference count on the underlying page alive for its lifetime. Holding many `AccessGuard` values simultaneously can increase memory usage if the associated pages would otherwise be evicted from the cache.

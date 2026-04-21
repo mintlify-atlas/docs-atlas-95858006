@@ -1,0 +1,207 @@
+---
+title: "Defining custom key and value types"
+description: "Implement the Value and Key traits for your own Rust structs and enums, or derive them automatically using the redb-derive companion crate."
+---
+
+redb uses two traits — `Value` and `Key` — to control how data is serialized into and deserialized from the on-disk B-tree. Many primitive types and standard library types already implement these traits. When you need to store your own structs or enums, you can either implement the traits by hand for full control, or reach for the `redb-derive` crate to generate the boilerplate automatically.
+
+## The `Value` trait
+
+Every type that can be stored in a redb table must implement `Value`:
+
+```rust
+pub trait Value: Debug {
+    /// `SelfType<'a>` is the type returned from `from_bytes`; it may borrow from the input.
+    type SelfType<'a>: Debug + 'a where Self: 'a;
+
+    /// The byte representation returned by `as_bytes`.
+    type AsBytes<'a>: AsRef<[u8]> + 'a where Self: 'a;
+
+    /// Returns `Some(n)` for fixed-width types or `None` for variable-width types.
+    fn fixed_width() -> Option<usize>;
+
+    /// Deserializes the type from a byte slice.
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a> where Self: 'a;
+
+    /// Serializes the type to bytes.
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a> where Self: 'b;
+
+    /// A globally unique name used to detect type mismatches between runs.
+    fn type_name() -> TypeName;
+}
+```
+
+`as_bytes` and `from_bytes` must be inverses of each other: for any value `v`, `from_bytes(as_bytes(v))` must round-trip correctly.
+
+## The `Key` trait
+
+A type that should also be usable as a table **key** must implement `Key` in addition to `Value`. Keys must have a total order:
+
+```rust
+pub trait Key: Value {
+    /// Compares two serialized keys. Must establish a total order.
+    fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering;
+}
+```
+
+redb calls `compare` directly on the raw bytes, so the ordering must be consistent with the serialization produced by `as_bytes`.
+
+## `TypeName` and schema safety
+
+`type_name()` returns a `TypeName` that redb stores in the database alongside each table. If you open a table with a different type than the one it was created with, redb returns a `TableError::TableTypeMismatch` error at runtime. Prefix your type names with your crate name to avoid collisions:
+
+```rust
+fn type_name() -> redb::TypeName {
+    redb::TypeName::new("my_crate::Point")
+}
+```
+
+## Manual implementation example
+
+The following shows a fixed-width `Point` struct implementing both `Value` and `Key`:
+
+```rust
+use redb::{Key, TypeName, Value};
+use std::cmp::Ordering;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+impl Value for Point {
+    type SelfType<'a> = Point where Self: 'a;
+    type AsBytes<'a> = [u8; 8] where Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        Some(8) // 4 bytes for x, 4 bytes for y
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Point where Self: 'a {
+        let x = i32::from_le_bytes(data[0..4].try_into().unwrap());
+        let y = i32::from_le_bytes(data[4..8].try_into().unwrap());
+        Point { x, y }
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> [u8; 8] where Self: 'b {
+        let mut result = [0u8; 8];
+        result[0..4].copy_from_slice(&value.x.to_le_bytes());
+        result[4..8].copy_from_slice(&value.y.to_le_bytes());
+        result
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::new("my_crate::Point")
+    }
+}
+
+impl Key for Point {
+    fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
+        let p1 = Point::from_bytes(data1);
+        let p2 = Point::from_bytes(data2);
+        p1.cmp(&p2)
+    }
+}
+```
+
+With both traits implemented you can use `Point` as a table key:
+
+```rust
+use redb::{Database, TableDefinition};
+
+const TABLE: TableDefinition<Point, u64> = TableDefinition::new("points");
+
+fn main() -> Result<(), redb::Error> {
+    let db = Database::create("points.redb")?;
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(TABLE)?;
+        table.insert(Point { x: 1, y: 2 }, 42)?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+```
+
+## Using `redb-derive` for automatic derivation
+
+The `redb-derive` crate provides `#[derive(Value)]` and `#[derive(Key)]` for structs. Add it to your `Cargo.toml`:
+
+```toml
+[dependencies]
+redb = "2"
+redb-derive = "2"
+```
+
+Both macros work on structs only (not enums). `#[derive(Key)]` additionally requires that the struct implements `Ord` (used to generate the `compare` implementation), and `#[derive(Value)]` requires that all field types also implement `Value`.
+
+```rust
+use redb::{Database, ReadableDatabase, TableDefinition, Value};
+use redb_derive::{Key, Value};
+
+#[derive(Debug, Key, Value, PartialEq, Eq, PartialOrd, Ord, Clone)]
+struct SomeKey {
+    foo: String,
+    bar: i32,
+}
+
+const TABLE: TableDefinition<SomeKey, u64> = TableDefinition::new("my_data");
+
+fn main() -> Result<(), redb::Error> {
+    let db = Database::create("derived_keys.redb")?;
+    let key = SomeKey {
+        foo: "example".to_string(),
+        bar: 42,
+    };
+
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(TABLE)?;
+        table.insert(key.clone(), 0)?;
+    }
+    write_txn.commit()?;
+
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(TABLE)?;
+    assert_eq!(table.get(&key)?.unwrap().value(), 0);
+
+    Ok(())
+}
+```
+
+<Note>
+The derived `type_name()` is constructed automatically from the struct name and field names/types. Because it encodes field information, renaming a field or changing a field type changes the `TypeName` and will cause a `TableTypeMismatch` error when opening an existing database. If you need to rename fields without breaking existing databases, implement `type_name()` manually and keep the original string.
+</Note>
+
+## Variable-width types
+
+When the serialized size depends on the value (e.g. a `String` field), `fixed_width()` must return `None`. The `AsBytes` associated type should then be `Vec<u8>`. The derive macro handles this automatically when any field is variable-width.
+
+```rust
+use redb::{TypeName, Value};
+
+#[derive(Debug)]
+struct Label(String);
+
+impl Value for Label {
+    type SelfType<'a> = Label where Self: 'a;
+    type AsBytes<'a> = Vec<u8> where Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        None
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Label where Self: 'a {
+        Label(std::str::from_utf8(data).unwrap().to_string())
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Vec<u8> where Self: 'b {
+        value.0.as_bytes().to_vec()
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::new("my_crate::Label")
+    }
+}
+```

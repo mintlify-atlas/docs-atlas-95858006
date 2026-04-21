@@ -1,0 +1,315 @@
+---
+title: "Database — redb API reference"
+description: "Complete reference for the Database struct, ReadOnlyDatabase, and the ReadableDatabase trait — the entry points for all redb read and write operations."
+---
+
+The `Database` struct is the root handle to a redb database file. All reads and writes flow through transactions obtained from a `Database` instance. Multiple concurrent readers are supported alongside a single writer; redb uses MVCC so reads never block writes and writes never block reads.
+
+## `Database`
+
+```rust
+pub struct Database { /* private fields */ }
+```
+
+An open redb database file. Use [`begin_write`](#begin_write) to obtain a `WriteTransaction` and [`begin_read`](#begin_read) to obtain a `ReadTransaction`. Only one write transaction may exist at a time; calls to `begin_write` block until any in-progress write finishes.
+
+### `Database::create`
+
+```rust
+pub fn create(path: impl AsRef<Path>) -> Result<Database, DatabaseError>
+```
+
+Opens the file at `path` as a redb database. If the file does not exist or is empty, a new database is initialised in it. If the file already contains a valid redb database it is opened normally. Any other file content returns an error.
+
+This is a shorthand for `Builder::new().create(path)`. Use [`Database::builder`](#database-builder) when you need to customise cache size or the repair callback.
+
+<ParamField path="path" type="impl AsRef<Path>" required>
+  Filesystem path to the database file. Created if it does not exist.
+</ParamField>
+
+**Returns** `Result<Database, DatabaseError>`
+
+**Errors**
+
+| Variant | When |
+|---|---|
+| `DatabaseError::DatabaseAlreadyOpen` | Another process holds a write lock on the file (platforms that support file locking). |
+| `DatabaseError::RepairAborted` | A repair was required and the repair callback called `RepairSession::abort`. |
+| `DatabaseError::UpgradeRequired(version)` | The file uses an older on-disk format that requires a manual upgrade. |
+| `DatabaseError::Storage(StorageError::Io(_))` | An I/O error occurred. |
+
+```rust
+use redb::{Database, TableDefinition};
+
+const TABLE: TableDefinition<&str, u64> = TableDefinition::new("counters");
+
+let db = Database::create("my_data.redb")?;
+```
+
+---
+
+### `Database::open`
+
+```rust
+pub fn open(path: impl AsRef<Path>) -> Result<Database, DatabaseError>
+```
+
+Opens an existing database file at `path`. Unlike `create`, this call returns an error if the file does not exist; it will never initialise a new database.
+
+<ParamField path="path" type="impl AsRef<Path>" required>
+  Path to an existing redb database file.
+</ParamField>
+
+**Returns** `Result<Database, DatabaseError>`
+
+**Errors** — same variants as [`create`](#databasecreate). Additionally returns an I/O error if the file does not exist.
+
+```rust
+let db = Database::open("my_data.redb")?;
+```
+
+---
+
+### `Database::builder`
+
+```rust
+pub fn builder() -> Builder
+```
+
+Returns a new [`Builder`](/api/builder) with default settings. Use the builder when you need to configure cache size, page size, or a repair callback before opening or creating a database.
+
+```rust
+let db = Database::builder()
+    .set_cache_size(256 * 1024 * 1024) // 256 MiB
+    .create("my_data.redb")?;
+```
+
+---
+
+### `begin_write`
+
+```rust
+pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError>
+```
+
+Begins a write transaction. Only one write transaction may be active at a time; if another write is in progress this call **blocks** until it completes.
+
+**Returns** `Result<WriteTransaction, TransactionError>`
+
+**Errors**
+
+| Variant | When |
+|---|---|
+| `TransactionError::Storage(StorageError::PreviousIo)` | A previous I/O error poisoned the database handle. Close and re-open the database. |
+
+```rust
+let write_txn = db.begin_write()?;
+{
+    let mut table = write_txn.open_table(TABLE)?;
+    table.insert("hits", &42)?;
+}
+write_txn.commit()?;
+```
+
+---
+
+### `begin_read`
+
+```rust
+fn begin_read(&self) -> Result<ReadTransaction, TransactionError>
+```
+
+Begins a read transaction. Captures a consistent snapshot of the database; only data committed *before* this call is visible. Multiple read transactions may exist concurrently, including while a write transaction is in progress.
+
+This method is provided by the [`ReadableDatabase`](#readabledatabase-trait) trait, which `Database` implements.
+
+**Returns** `Result<ReadTransaction, TransactionError>`
+
+```rust
+let read_txn = db.begin_read()?;
+let table = read_txn.open_table(TABLE)?;
+println!("{:?}", table.get("hits")?);
+```
+
+---
+
+### `compact`
+
+```rust
+pub fn compact(&mut self) -> Result<bool, CompactionError>
+```
+
+Compacts the database file by relocating live pages toward the beginning of the file and then truncating it. Compaction runs iteratively until no further progress is possible.
+
+Returns `true` if any compaction was performed, `false` if the file was already fully compact.
+
+<Warning>
+  Compaction requires exclusive access: no read or write transactions may be alive, and no savepoints (ephemeral or persistent) may exist when this is called.
+</Warning>
+
+**Returns** `Result<bool, CompactionError>`
+
+**Errors**
+
+| Variant | When |
+|---|---|
+| `CompactionError::TransactionInProgress` | A read transaction is still alive. |
+| `CompactionError::PersistentSavepointExists` | At least one persistent savepoint exists. |
+| `CompactionError::EphemeralSavepointExists` | At least one ephemeral savepoint exists. |
+| `CompactionError::Storage(_)` | An I/O error occurred. |
+
+```rust
+let compacted = db.compact()?;
+if compacted {
+    println!("Database file shrunk");
+}
+```
+
+---
+
+### `check_integrity`
+
+```rust
+pub fn check_integrity(&mut self) -> Result<bool, DatabaseError>
+```
+
+Forces a full integrity check of the database file and repairs it if possible.
+
+Returns `Ok(true)` if the database passed all checks, `Ok(false)` if it had corruption that was successfully repaired, or `Err(DatabaseError::Storage(StorageError::Corrupted(_)))` if the corruption could not be repaired.
+
+<Note>
+  Calling this during normal operation is unnecessary. redb automatically detects and recovers from crashes and unclean shutdowns on next open. Use `check_integrity` only when you suspect external modification of the file or a redb bug.
+</Note>
+
+**Returns** `Result<bool, DatabaseError>`
+
+**Errors**
+
+| Variant | When |
+|---|---|
+| `DatabaseError::TransactionInProgress` | A read or write transaction is still alive. |
+| `DatabaseError::Storage(StorageError::Corrupted(_))` | Corruption was found and could not be repaired. |
+
+```rust
+match db.check_integrity()? {
+    true  => println!("Database is clean"),
+    false => println!("Repaired successfully"),
+}
+```
+
+---
+
+### `cache_stats`
+
+```rust
+fn cache_stats(&self) -> CacheStats
+```
+
+Returns metrics about the in-memory page cache. Provided by the [`ReadableDatabase`](#readabledatabase-trait) trait.
+
+<Info>
+  Cache hit/miss counters are only populated when the `cache_metrics` Cargo feature is enabled. With the feature disabled the counters are always zero.
+</Info>
+
+**Returns** [`CacheStats`](#cachestats)
+
+---
+
+## `CacheStats`
+
+```rust
+pub struct CacheStats { /* private fields */ }
+```
+
+Snapshot of in-memory cache usage at the time [`cache_stats`](#cache_stats) was called.
+
+| Method | Type | Description |
+|---|---|---|
+| `evictions() -> u64` | `u64` | Pages evicted because the cache was full. |
+| `read_hits() -> u64` | `u64` | Reads of unmodified data served from the cache. |
+| `read_misses() -> u64` | `u64` | Reads of unmodified data that fell through to storage. |
+| `write_hits() -> u64` | `u64` | Reads of transaction-modified data served from cache. |
+| `write_misses() -> u64` | `u64` | Reads of transaction-modified data that fell through to storage. |
+| `used_bytes() -> usize` | `usize` | Bytes currently held in the cache. |
+
+---
+
+## `ReadableDatabase` trait
+
+```rust
+pub trait ReadableDatabase {
+    fn begin_read(&self) -> Result<ReadTransaction, TransactionError>;
+    fn cache_stats(&self) -> CacheStats;
+}
+```
+
+Both `Database` and `ReadOnlyDatabase` implement this trait, letting you write code that works with either handle.
+
+---
+
+## `ReadOnlyDatabase`
+
+```rust
+pub struct ReadOnlyDatabase { /* private fields */ }
+```
+
+An open redb database in **read-only** mode. Multiple processes may open a `ReadOnlyDatabase` simultaneously, but it may not be opened while the same file is open as a `Database` (the write lock prevents this on platforms that support file locking).
+
+### `ReadOnlyDatabase::open`
+
+```rust
+pub fn open(path: impl AsRef<Path>) -> Result<ReadOnlyDatabase, DatabaseError>
+```
+
+Opens an existing redb database file in read-only mode.
+
+<Warning>
+  `ReadOnlyDatabase` can only be opened on a database that was last closed cleanly. If the previous write session did not use two-phase commit and did not update the allocator state table (i.e. the database requires repair), `open` returns `DatabaseError::RepairAborted` because repair requires write access.
+</Warning>
+
+<ParamField path="path" type="impl AsRef<Path>" required>
+  Path to an existing redb database file.
+</ParamField>
+
+**Returns** `Result<ReadOnlyDatabase, DatabaseError>`
+
+```rust
+use redb::{ReadOnlyDatabase, ReadableDatabase, TableDefinition};
+
+const TABLE: TableDefinition<u64, u64> = TableDefinition::new("my_data");
+
+let db = ReadOnlyDatabase::open("my_data.redb")?;
+let txn = db.begin_read()?;
+let table = txn.open_table(TABLE)?;
+println!("{:?}", table.get(&0)?);
+```
+
+`ReadOnlyDatabase` also implements [`ReadableDatabase`](#readabledatabase-trait), so `begin_read` and `cache_stats` are available on it.
+
+---
+
+## `RepairSession`
+
+```rust
+pub struct RepairSession { /* private fields */ }
+```
+
+Passed to the repair callback (configured with [`Builder::set_repair_callback`](/api/builder#set_repair_callback)) each time redb needs to report progress during a repair operation.
+
+| Method | Description |
+|---|---|
+| `progress() -> f64` | Estimated completion in `[0.0, 1.0)`. |
+| `abort(&mut self)` | Cancels the repair. The corresponding `open` or `create` call returns `DatabaseError::RepairAborted`. |
+
+```rust
+use redb::{Builder, RepairSession};
+
+let db = Builder::new()
+    .set_repair_callback(|session: &mut RepairSession| {
+        println!("Repair progress: {:.0}%", session.progress() * 100.0);
+        // call session.abort() to cancel
+    })
+    .create("my_data.redb")?;
+```
+
+The callback may be invoked multiple times during a single repair. There is no upper bound on how many times it is called. If the database opens cleanly the callback is never invoked.

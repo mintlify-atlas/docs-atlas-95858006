@@ -1,0 +1,129 @@
+---
+title: "Using savepoints and rollbacks in redb"
+description: "Create ephemeral and persistent savepoints in redb write transactions, restore the database to an earlier state, and manage savepoint lifecycles safely."
+---
+
+Savepoints let you capture a snapshot of the database at a point in time within a write transaction, then roll back to that snapshot later. This is useful for implementing tentative writes, multi-step operations with a safe abort path, or long-lived checkpoints that survive across process restarts. redb offers two kinds of savepoints: **ephemeral** savepoints that last only as long as the `Savepoint` value is alive, and **persistent** savepoints that are written to the database file and survive process restarts.
+
+## What is a savepoint?
+
+A savepoint records the root of the database B-tree at a specific moment during a write transaction. Calling `restore_savepoint` rewinds the transaction's view of the data to that snapshot — any pages allocated after the savepoint was taken are freed, and the table tree is reset to the saved root. All savepoints newer than the restored one are invalidated automatically.
+
+Savepoints can only be created **before** the transaction is dirty, meaning no tables may have been opened for writing yet in that transaction. Attempting to create a savepoint after opening a table returns `SavepointError::InvalidSavepoint`.
+
+## Ephemeral savepoints
+
+An ephemeral savepoint is the simpler form. It exists only in memory and is automatically freed when the `Savepoint` value is dropped.
+
+```rust
+use redb::{Database, Durability, TableDefinition};
+
+const TABLE: TableDefinition<u64, &str> = TableDefinition::new("data");
+
+fn main() -> Result<(), redb::Error> {
+    let db = Database::create("my_db.redb")?;
+
+    let mut txn = db.begin_write()?;
+
+    // Capture a savepoint before any writes
+    let savepoint = txn.ephemeral_savepoint()?;
+
+    // Make some tentative writes
+    {
+        let mut table = txn.open_table(TABLE)?;
+        table.insert(&1, "hello")?;
+        table.insert(&2, "world")?;
+    }
+
+    // Decide to roll back — restores the tree to the state at `savepoint`
+    txn.restore_savepoint(&savepoint)?;
+
+    // The inserts above are gone; commit the clean state
+    txn.commit()?;
+    Ok(())
+}
+```
+
+Dropping `savepoint` releases the in-memory resources held by the snapshot. While a savepoint is live, pages that become unreachable after it was created are not freed, so savepoint lifetimes should be kept as short as possible.
+
+## Persistent savepoints
+
+A persistent savepoint is written into the database file itself. It survives process crashes and restarts, and can be retrieved by ID in any subsequent write transaction.
+
+<Steps>
+
+### Create a persistent savepoint
+
+Call `persistent_savepoint()` on a write transaction **before** opening any tables. The method returns a `u64` identifier that you must store for later use.
+
+```rust
+use redb::{Database, TableDefinition};
+
+const TABLE: TableDefinition<u64, u64> = TableDefinition::new("counters");
+
+fn main() -> Result<(), redb::Error> {
+    let db = Database::create("my_db.redb")?;
+
+    let txn = db.begin_write()?;
+    let savepoint_id = txn.persistent_savepoint()?;
+    println!("Saved checkpoint id={savepoint_id}");
+    txn.commit()?;
+
+    Ok(())
+}
+```
+
+### Retrieve and restore a persistent savepoint
+
+In a later write transaction, call `get_persistent_savepoint(id)` to load the `Savepoint` struct, then pass it to `restore_savepoint`.
+
+```rust
+fn restore(db: &redb::Database, savepoint_id: u64) -> Result<(), redb::Error> {
+    let mut txn = db.begin_write()?;
+    let savepoint = txn.get_persistent_savepoint(savepoint_id)?;
+    txn.restore_savepoint(&savepoint)?;
+    txn.commit()?;
+    Ok(())
+}
+```
+
+### Delete a persistent savepoint
+
+Persistent savepoints are not freed automatically. When you no longer need one, delete it to allow the database to reclaim the pages it was keeping alive.
+
+```rust
+fn cleanup(db: &redb::Database, savepoint_id: u64) -> Result<(), redb::Error> {
+    let txn = db.begin_write()?;
+    txn.delete_persistent_savepoint(savepoint_id)?;
+    txn.commit()?;
+    Ok(())
+}
+```
+
+You can also iterate over all existing persistent savepoints with `list_persistent_savepoints()`.
+
+</Steps>
+
+<Warning>
+Creating, deleting, or restoring to a persistent savepoint (when newer persistent savepoints exist) requires the transaction's durability to be `Durability::Immediate`. If the transaction's durability has been lowered with `set_durability`, these operations return `SavepointError::ImmediateDurabilityRequired`. This constraint exists because modifying persistent savepoints requires an atomic, durable on-disk update.
+</Warning>
+
+## Listing all persistent savepoints
+
+```rust
+fn list(db: &redb::Database) -> Result<(), redb::Error> {
+    let txn = db.begin_write()?;
+    for id in txn.list_persistent_savepoints()? {
+        println!("Persistent savepoint id={id}");
+    }
+    txn.abort()?;
+    Ok(())
+}
+```
+
+## Constraints and caveats
+
+- Savepoints cannot be created on a dirty transaction (one where a table has already been opened). The call returns `SavepointError::InvalidSavepoint`.
+- Restoring a savepoint invalidates all savepoints that were created after it. Attempting to use an invalidated savepoint returns `SavepointError::InvalidSavepoint`.
+- A `Savepoint` handle is tied to a specific `Database` instance. Passing a savepoint from a different database to `restore_savepoint` returns `SavepointError::InvalidSavepoint`.
+- While any savepoint exists (ephemeral or persistent), `Database::compact` will return an error. Delete all savepoints before compacting.

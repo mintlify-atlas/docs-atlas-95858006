@@ -1,0 +1,123 @@
+---
+title: "Configuring transaction durability levels"
+description: "Control when redb flushes data to disk by choosing between Immediate and None durability per write transaction, including bulk import patterns."
+---
+
+By default every committed redb write transaction is immediately flushed and synced to persistent storage before `commit()` returns. This is the safest option, but `fsync` calls are expensive. When your workload can tolerate weaker guarantees — for example, a cache or a bulk-import pipeline — you can lower the durability level on individual transactions to avoid the sync cost and improve throughput.
+
+## The `Durability` enum
+
+redb exposes durability through the `Durability` enum:
+
+```rust
+#[non_exhaustive]
+pub enum Durability {
+    /// Commits with this level will not be persisted unless followed by
+    /// a commit with `Durability::Immediate`.
+    None,
+
+    /// The commit is guaranteed to be on persistent storage as soon as
+    /// `WriteTransaction::commit()` returns.
+    Immediate,
+}
+```
+
+The default is `Durability::Immediate`. You can change it on a per-transaction basis by calling `set_durability` before calling `commit`.
+
+## `Durability::Immediate`
+
+This is the default. redb calls `sync_data` on the storage backend after writing the commit record, so data is guaranteed to survive a crash or power loss by the time `commit()` returns.
+
+```rust
+use redb::{Database, Durability, TableDefinition};
+
+const TABLE: TableDefinition<u64, u64> = TableDefinition::new("data");
+
+fn main() -> Result<(), redb::Error> {
+    let db = Database::create("my_db.redb")?;
+
+    let mut txn = db.begin_write()?;
+    // Immediate is the default, but you can be explicit:
+    txn.set_durability(Durability::Immediate)?;
+    {
+        let mut table = txn.open_table(TABLE)?;
+        table.insert(&1, &100)?;
+    }
+    txn.commit()?; // fsync happens here; data is durable on return
+    Ok(())
+}
+```
+
+Use `Immediate` whenever:
+- You are writing data that must not be lost under any circumstances.
+- You are creating or deleting persistent savepoints (required by the API).
+- You want maximum safety at the cost of write throughput.
+
+## `Durability::None`
+
+With `Durability::None`, redb writes the data but skips the `sync_data` call. The commit is visible to subsequent transactions in the same process, but it is **not** guaranteed to survive a crash or power loss unless a later `Durability::Immediate` commit is made.
+
+```rust
+fn bulk_import(db: &redb::Database, items: &[(u64, u64)]) -> Result<(), redb::Error> {
+    const TABLE: TableDefinition<u64, u64> = TableDefinition::new("data");
+
+    for chunk in items.chunks(1000) {
+        let mut txn = db.begin_write()?;
+        txn.set_durability(Durability::None)?;
+        {
+            let mut table = txn.open_table(TABLE)?;
+            for (k, v) in chunk {
+                table.insert(k, v)?;
+            }
+        }
+        txn.commit()?; // no fsync; fast but not crash-safe
+    }
+
+    // Final commit with Immediate durability to flush everything to disk
+    let mut txn = db.begin_write()?;
+    txn.set_durability(Durability::Immediate)?;
+    txn.commit()?;
+
+    Ok(())
+}
+```
+
+Use `Durability::None` when:
+- You are doing a large bulk import and will follow it with an `Immediate` commit.
+- The data is easily reproducible and losing in-flight writes is acceptable.
+- You are using an in-memory backend where `sync_data` is a no-op anyway.
+
+<Warning>
+`Durability::None` does **not** mean the transaction is in a degraded or inconsistent state — redb's internal data structures remain valid after a `None` commit. However, if the process crashes before a subsequent `Durability::Immediate` commit is made, the `None` commits will be rolled back entirely on the next open. Your application must be prepared to redo or discard those writes.
+</Warning>
+
+## Choosing the right level
+
+| Level | `fsync` on commit | Survives crash | Typical use case |
+|---|---|---|---|
+| `Immediate` | Yes | Yes | General writes, persistent savepoints |
+| `None` | No | No (rolled back on restart) | Bulk imports, ephemeral caches, testing |
+
+## Interaction with persistent savepoints
+
+`set_durability` returns `Err(SetDurabilityError::PersistentSavepointModified)` if you try to lower durability after creating or deleting a persistent savepoint in the same transaction. Persistent savepoint operations require `Immediate` durability to guarantee the on-disk savepoint table stays consistent.
+
+```rust
+fn example(db: &redb::Database) -> Result<(), redb::Error> {
+    let mut txn = db.begin_write()?;
+
+    // Create a persistent savepoint — locks us into Immediate durability
+    let _id = txn.persistent_savepoint()?;
+
+    // This will return an error: PersistentSavepointModified
+    let result = txn.set_durability(Durability::None);
+    assert!(result.is_err());
+
+    txn.commit()?;
+    Ok(())
+}
+```
+
+## Interaction with `Savepoint::restore_savepoint`
+
+`restore_savepoint` also requires `Durability::Immediate` when newer persistent savepoints exist and must be deleted as part of the restore. If the transaction's durability has been lowered before calling `restore_savepoint` in that situation, the call returns `SavepointError::ImmediateDurabilityRequired`.

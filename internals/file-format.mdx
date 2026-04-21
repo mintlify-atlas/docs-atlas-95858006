@@ -1,0 +1,262 @@
+---
+title: "redb on-disk file format reference"
+description: "Binary layout of a redb database file: super-header, commit slots, region structure, B-tree branch and leaf pages, checksums, and version history."
+---
+
+A redb database file is a sequence of fixed-size regions preceded by a 512-byte super-header. Every multi-byte integer is stored in **little-endian order**. All data outside the super-header lives in B-tree pages, and every page carries an XXH3\_128 checksum so that a partially-written commit can be detected and rolled back on the next open.
+
+<Note>
+The file format has been stable since v1 and redb commits to providing an upgrade path for any future changes. The current format version is **v3**. Databases created with v1 or v2 can be migrated using `Database::upgrade()` before upgrading to redb 3.x or later.
+</Note>
+
+## High-level layout
+
+```
+<-------------------------------------------- 8 bytes ------------------------------------------->
+========================================== Super header ==========================================
+---------------------------------------- Header (64 bytes) ---------------------------------------
+| magic number                                                                                   |
+| magic con.| god byte  | padding               | page size                                      |
+| region header pages                           | region max data pages                          |
+| number of full regions                        | data pages in trailing region                  |
+| padding                                                                                        |
+| padding                                                                                        |
+| padding                                                                                        |
+| padding                                                                                        |
+------------------------------------ Commit slot 0 (128 bytes) -----------------------------------
+| version   | user nn   | sys nn    | f-root nn | padding                                        |
+| user root page number                                                                          |
+| user root checksum                                                                             |
+| user root checksum (cont.)                                                                     |
+| user root length                                                                               |
+| system root page number                                                                        |
+| system root checksum                                                                           |
+| system root checksum (cont.)                                                                   |
+| system root length                                                                             |
+| padding                                                                                        |
+| padding                                                                                        |
+| padding                                                                                        |
+| padding                                                                                        |
+| transaction id                                                                                 |
+| slot checksum                                                                                  |
+| slot checksum (cont.)                                                                          |
+----------------------------------------- Commit slot 1 ------------------------------------------
+|                                 Same layout as commit slot 0                                   |
+---------------------------------- footer padding (192+ bytes) -----------------------------------
+==================================================================================================
+| Region header (unused as of v3)                                                                |
+--------------------------------------------------------------------------------------------------
+| Region data                                                                                    |
+==================================================================================================
+| ...more regions                                                                                |
+==================================================================================================
+```
+
+## Database super-header
+
+The super-header is 512 bytes (rounded up to the nearest page) and is the only part of the file that is not copy-on-write. It is divided into a 64-byte immutable **header** and two 128-byte **commit slots**, with padding filling the remainder.
+
+### Database header (64 bytes)
+
+The header holds immutable configuration set when the database is first created, plus the single "god byte" that controls which commit slot is live.
+
+| Field | Size | Description |
+|---|---|---|
+| Magic number | 9 bytes | ASCII `redb` followed by `0x1A 0x0A 0xA9 0x0D 0x0A` (inspired by PNG) |
+| God byte | 1 byte | Bitfield — see below |
+| Padding | 2 bytes | Alignment |
+| Page size | 4 bytes | Size of a redb page in bytes |
+| Region header pages | 4 bytes | Number of pages in each region's header |
+| Region max data pages | 4 bytes | Maximum data pages per region |
+| Number of full regions | 4 bytes | Count of fully populated regions (valid only after clean shutdown / repair) |
+| Data pages in trailing region | 4 bytes | Pages used in the last (partial) region |
+| Padding | 32 bytes | Reserved, pads to 64 bytes |
+
+#### The god byte
+
+The god byte is the atomic switch that makes single-`fsync` commits possible. It is a bitfield with three flags:
+
+- **Bit 0 — `primary_bit`**: selects whether commit slot 0 or slot 1 holds the latest committed transaction.
+- **Bit 1 — `recovery_required`**: when set, redb must run recovery on open. Recovery may be a full repair (walk all B-tree roots and rebuild allocator state) or a quick-repair (load allocator state from the system table).
+- **Bit 2 — `two_phase_commit`**: when set, the primary slot was written with 2-phase commit and is guaranteed valid; recovery will not fall back to the secondary slot.
+
+Because all three flags live in a single byte, updating the primary pointer and the recovery flag is an atomic operation — no partial writes can leave the file in an ambiguous state.
+
+### Commit slot layout (128 bytes each)
+
+Both slots share the same binary layout. The active slot is the one pointed to by `primary_bit` in the god byte.
+
+| Field | Size | Description |
+|---|---|---|
+| File format version | 1 byte | Allows atomic in-place format upgrades |
+| User root non-null flag | 1 byte | Boolean — is the user table tree present? |
+| System root non-null flag | 1 byte | Boolean — is the system table tree present? |
+| Freed-root non-null flag | 1 byte | Boolean — legacy; used in v1/v2 |
+| Padding | 4 bytes | Alignment to 64-bit boundary |
+| User root page number | 8 bytes | Page number of the user table tree root |
+| User root checksum | 16 bytes | XXH3\_128 checksum of the user root page |
+| User root length | 8 bytes | Number of tables (added in v2) |
+| System root page number | 8 bytes | Page number of the system table tree root |
+| System root checksum | 16 bytes | XXH3\_128 checksum of the system root page |
+| System root length | 8 bytes | Number of system tables (added in v2) |
+| Padding | 40 bytes | Reserved |
+| Transaction ID | 8 bytes | Monotonically increasing commit counter |
+| Slot checksum | 16 bytes | XXH3\_128 checksum of all preceding fields in the slot |
+
+The slot checksum covers all preceding bytes in the slot. On recovery, redb computes this checksum independently; a mismatch means the slot was partially written and should be discarded in favour of the other slot.
+
+## Region layout
+
+Each region starts with a short header followed by contiguous data pages.
+
+```
+<-------------------------------------------- 8 bytes ------------------------------------------->
+==================================================================================================
+| version  | padding                            | allocator state length                         |
+--------------------------------------------------------------------------------------------------
+| Regional allocator state                                                                       |
+==================================================================================================
+| Region pages                                                                                   |
+==================================================================================================
+```
+
+As of file format v3 the region header is not used at runtime; allocator state is stored in the system table tree instead (see the regional allocator state section below).
+
+| Field | Size | Description |
+|---|---|---|
+| Region format version | 1 byte | Version of the region header format |
+| Padding | 3 bytes | Alignment |
+| Allocator state length | 4 bytes | Length of the serialized allocator state in bytes |
+| Allocator state | n bytes | Buddy allocator free-list data (see below) |
+
+### Regional allocator state
+
+The regional buddy allocator tracks free pages within a region. It is serialized as:
+
+```
+<-------------------------------------------- 8 bytes ------------------------------------------->
+==================================================================================================
+| max order | padding                           | number of pages                                |
+--------------------------------------------------------------------------------------------------
+| Order end offsets...                                                                           |
+==================================================================================================
+| Order allocator state...                                                                       |
+==================================================================================================
+```
+
+The backing data structure is a `BtreeBitmap` — a 64-way tree where each node is a single bit indicating whether any descendant page is free. The tree is serialized as:
+
+```
+<-------------------------------------------- 8 bytes ------------------------------------------->
+==================================================================================================
+| height                                        | end offset...                                  |
+==================================================================================================
+| Tree data                                                                                      |
+==================================================================================================
+```
+
+A second structure, `U64GroupedBitmap`, tracks the order at which each even-address range has been allocated, enabling the buddy allocator to merge freed pages back into larger blocks.
+
+### Region tracker
+
+The region tracker is an array of `BtreeBitmap`s, one per region, recording which page orders contain free pages. Its layout:
+
+```
+<-------------------------------------------- 8 bytes ------------------------------------------->
+==================================================================================================
+| num_allocators                                | sub_allocator_len                              |
+| BtreeBitmap data...                                                                            |
+==================================================================================================
+```
+
+On a clean shutdown the region tracker is written to a page in the data section. When quick-repair is enabled (v3 default) it is instead stored as an entry in the allocator state system table, which remains valid even after a crash.
+
+## B-tree pages
+
+All data in the region's page area is stored in one of two B-tree page types. Each page carries checksums of its child pages in branch nodes, forming a Merkle tree whose root hash is stored in the commit slot.
+
+### Branch page
+
+Branch pages index into child pages. Keys are stored in sorted order and used to route lookups to the correct child.
+
+```
+<-------------------------------------------- 8 bytes ------------------------------------------->
+==================================================================================================
+| type     | padding   | number of keys        | padding                                         |
+--------------------------------------------------------------------------------------------------
+| child page checksum (repeated num_keys + 1 times)                                              |
+|                                                                                                |
+--------------------------------------------------------------------------------------------------
+| child page number (repeated num_keys + 1 times)                                                |
+--------------------------------------------------------------------------------------------------
+| (optional) key end (repeated num_keys times) | alignment padding                               |
+==================================================================================================
+| Key data                                                                                       |
+==================================================================================================
+```
+
+| Field | Size | Description |
+|---|---|---|
+| Type | 1 byte | Always `2` for a branch page |
+| Padding | 1 byte | Alignment to 16-bit boundary |
+| `num_keys` | 2 bytes | Number of keys stored in this branch |
+| Padding | 4 bytes | Alignment to 64-bit boundary |
+| Child checksums | 16 × (`num_keys` + 1) bytes | XXH3\_128 checksum of each child page |
+| Child page numbers | 8 × (`num_keys` + 1) bytes | Page numbers of child pages |
+| Key ends (optional) | 4 × `num_keys` bytes | Ending byte offset of each key; **omitted for fixed-width key types** |
+| Alignment padding | variable | Pads key data start to the key type's required alignment |
+| Key data | variable | Raw key bytes, concatenated |
+
+### Leaf page
+
+Leaf pages store the actual key-value pairs.
+
+```
+<-------------------------------------------- 8 bytes ------------------------------------------->
+==================================================================================================
+| type     | padding   | number of entries      | (optional) key end (repeated entries times)    |
+--------------------------------------------------------------------------------------------------
+| (optional) value end (repeated entries times) | (optional) key alignment padding               |
+==================================================================================================
+| Key data                                      | (optional) value alignment padding             |
+==================================================================================================
+| Value data                                                                                     |
+==================================================================================================
+```
+
+| Field | Size | Description |
+|---|---|---|
+| Type | 1 byte | Always `1` for a leaf page |
+| Padding | 1 byte | Alignment to 16-bit boundary |
+| `num_entries` | 2 bytes | Number of key-value pairs in the leaf |
+| Key ends (optional) | 4 × `num_entries` bytes | Ending offset of each key; **omitted for fixed-width key types** |
+| Value ends (optional) | 4 × `num_entries` bytes | Ending offset of each value; **omitted for fixed-width value types** |
+| Key alignment padding | variable | Pads key data start to the key type's required alignment |
+| Key data | variable | Concatenated raw key bytes |
+| Value alignment padding | variable | Pads value data start to the value type's required alignment |
+| Value data | variable | Concatenated raw value bytes |
+
+Omitting the `key_end` and `value_end` arrays for fixed-width types saves space and makes random access O(1) — the offset of entry `i` is simply `i × fixed_size`.
+
+## Checksums
+
+redb uses **XXH3\_128** (the 128-bit variant of XXH3) throughout. Each B-tree page stores the checksums of its child pages inside the parent's branch page, forming an implicit Merkle tree. The root checksum is stored in the commit slot. On recovery, redb walks the tree from the root and verifies every checksum it encounters; any mismatch causes the commit to be treated as incomplete and rolled back.
+
+The slot itself has its own `slot checksum` field covering all bytes in the slot, providing a fast first-pass check before walking the tree.
+
+## File format version history
+
+### v1 — Initial format
+
+Introduced the super-header, double-buffered commit slots, god byte, region layout, and the three-tree model (data tree, system tree, freed tree). Established the XXH3\_128 checksum scheme.
+
+### v2 — Length fields
+
+Added a `length` field to both the user table tree and the system table tree entries. This allows `Table::len()` and related methods to run in O(1) time rather than requiring a full tree scan.
+
+### v3 — Storage optimizations and format simplification
+
+- Removed the standalone freed tree. Free-page tracking is now split across two system tables: one for data-tree freed pages and one for system-tree freed pages.
+- Added an "allocated pages" system table that records pages allocated by each transaction when a savepoint is active, enabling efficient savepoint rollback.
+- Removed the on-disk allocator state from the region header as the primary runtime path. Quick-repair (storing allocator state in the system table) is now the default, reducing the minimum database file size from ~2.5 MiB to ~50 KiB.
+- The region header field still exists for backward compatibility but is unused at runtime in v3.

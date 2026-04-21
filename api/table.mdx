@@ -1,0 +1,397 @@
+---
+title: "Table — read and write key-value data"
+description: "API reference for Table<K,V> and ReadOnlyTable<K,V>: insert, remove, range iteration, and storage statistics for typed key-value tables in redb."
+---
+
+`Table<K, V>` is the primary writable interface to a key-value table in redb. It is obtained from a `WriteTransaction` via `open_table` and gives you full read-write access for the duration of that transaction. `ReadOnlyTable<K, V>` provides the same read methods from a `ReadTransaction`. Both types implement the `ReadableTable` trait, which is the common read interface shared by all table handles.
+
+## Table\<K, V\>
+
+A writable table scoped to a `WriteTransaction`. Dropping the table without committing the transaction discards all changes. Only one `Table` handle to a given table name may be open at a time within a transaction.
+
+```rust
+use redb::{Database, TableDefinition};
+
+const TABLE: TableDefinition<&str, u64> = TableDefinition::new("my_data");
+
+let db = Database::create("my.db")?;
+let write_txn = db.begin_write()?;
+{
+    let mut table = write_txn.open_table(TABLE)?;
+    table.insert("hello", &42)?;
+}
+write_txn.commit()?;
+```
+
+### insert
+
+```rust
+pub fn insert<'k, 'v>(
+    &mut self,
+    key: impl Borrow<K::SelfType<'k>>,
+    value: impl Borrow<V::SelfType<'v>>,
+) -> Result<Option<AccessGuard<'_, V>>>
+```
+
+Inserts a key-value mapping. If the key was already present it is replaced and the old value is returned wrapped in `Some`. Returns `None` if the key was not present before.
+
+<ParamField path="key" type="impl Borrow<K::SelfType<'k>>">
+  The key to insert. Must satisfy the `Key` bound on the table definition.
+</ParamField>
+
+<ParamField path="value" type="impl Borrow<V::SelfType<'v>>">
+  The value to associate with the key. Must satisfy the `Value` bound on the table definition.
+</ParamField>
+
+<Warning>
+  Returns `Err(StorageError::ValueTooLarge)` if the serialised key or value exceeds the internal size limits, or if the combined key+value size exceeds `MAX_PAIR_LENGTH`.
+</Warning>
+
+### insert\_reserve
+
+```rust
+pub fn insert_reserve<'a>(
+    &mut self,
+    key: impl Borrow<K::SelfType<'a>>,
+    value_length: usize,
+) -> Result<AccessGuardMutInPlace<'_, V>>
+```
+
+Reserves `value_length` bytes for a value in-place, returning a mutable handle. The caller writes the value bytes directly through the `AsMut` impl on `AccessGuardMutInPlace`. If the key was already present it is replaced.
+
+This method is only available when `V: MutInPlaceValue` (e.g. `[u8]`).
+
+<ParamField path="key" type="impl Borrow<K::SelfType<'a>>">
+  The key to insert or replace.
+</ParamField>
+
+<ParamField path="value_length" type="usize">
+  The exact number of bytes to reserve for the value.
+</ParamField>
+
+```rust
+// Write a 16-byte value without an intermediate allocation
+let mut guard = table.insert_reserve("blob", 16)?;
+guard.as_mut().copy_from_slice(&[0u8; 16]);
+```
+
+### get\_mut
+
+```rust
+pub fn get_mut<'k>(
+    &mut self,
+    key: impl Borrow<K::SelfType<'k>>,
+) -> Result<Option<AccessGuardMut<'_, V>>>
+```
+
+Returns a mutable accessor for an existing value. Returns `None` if the key is not present. The `AccessGuardMut` handle lets you call `.value()` to read and `.insert(new_value)` to replace the value in-place, without going through a separate `remove` + `insert` round-trip.
+
+### remove
+
+```rust
+pub fn remove<'a>(
+    &mut self,
+    key: impl Borrow<K::SelfType<'a>>,
+) -> Result<Option<AccessGuard<'_, V>>>
+```
+
+Removes the given key. Returns the removed value via `AccessGuard` if the key was present, or `None` otherwise.
+
+<ParamField path="key" type="impl Borrow<K::SelfType<'a>>">
+  The key to remove.
+</ParamField>
+
+### pop\_first
+
+```rust
+pub fn pop_first(&mut self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>>
+```
+
+Removes and returns the smallest key-value pair in the table. Returns `None` if the table is empty.
+
+### pop\_last
+
+```rust
+pub fn pop_last(&mut self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>>
+```
+
+Removes and returns the largest key-value pair in the table. Returns `None` if the table is empty.
+
+### extract\_if
+
+```rust
+pub fn extract_if<F>(
+    &mut self,
+    predicate: F,
+) -> Result<ExtractIf<'_, K, V, F>>
+where
+    F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
+```
+
+Applies `predicate` to every key-value pair across the whole table. Entries for which `predicate` returns `true` are yielded by the returned `ExtractIf` iterator and removed from the table **only as they are consumed from the iterator**. Entries that are never read from the iterator are not removed.
+
+### extract\_from\_if
+
+```rust
+pub fn extract_from_if<'a, KR, F>(
+    &mut self,
+    range: impl RangeBounds<KR> + 'a,
+    predicate: F,
+) -> Result<ExtractIf<'_, K, V, F>>
+where
+    KR: Borrow<K::SelfType<'a>> + 'a,
+    F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
+```
+
+Like `extract_if`, but restricted to a key range.
+
+### retain
+
+```rust
+pub fn retain<F>(
+    &mut self,
+    predicate: F,
+) -> Result
+where
+    F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
+```
+
+Removes all entries for which `predicate` returns `false`, across the entire table.
+
+### retain\_in
+
+```rust
+pub fn retain_in<'a, KR, F>(
+    &mut self,
+    range: impl RangeBounds<KR> + 'a,
+    predicate: F,
+) -> Result
+where
+    KR: Borrow<K::SelfType<'a>> + 'a,
+    F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
+```
+
+Like `retain`, but restricted to a key range.
+
+---
+
+## ReadableTable\<K, V\> trait
+
+Both `Table<K, V>` and `ReadOnlyTable<K, V>` implement this trait. It extends `ReadableTableMetadata`.
+
+### get
+
+```rust
+fn get<'a>(
+    &self,
+    key: impl Borrow<K::SelfType<'a>>,
+) -> Result<Option<AccessGuard<'_, V>>>
+```
+
+Returns the value for `key`, or `None` if it is absent. The returned `AccessGuard` borrows from the table for the duration of the immutable borrow.
+
+```rust
+if let Some(guard) = table.get("hello")? {
+    println!("{}", guard.value());
+}
+```
+
+### range
+
+```rust
+fn range<'a, KR>(
+    &self,
+    range: impl RangeBounds<KR> + 'a,
+) -> Result<Range<'_, K, V>>
+where
+    KR: Borrow<K::SelfType<'a>> + 'a,
+```
+
+Returns a double-ended `Range` iterator over the specified key range. Accepts any `RangeBounds` expression (`..`, `a..b`, `a..=b`, `a..`, `..b`).
+
+```rust
+let read_txn = db.begin_read()?;
+let table = read_txn.open_table(TABLE)?;
+for result in table.range("a"..="z")? {
+    let (key, value) = result?;
+    println!("{} = {}", key.value(), value.value());
+}
+```
+
+### first / last
+
+```rust
+fn first(&self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>>
+fn last(&self)  -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>>
+```
+
+Return the first (smallest key) or last (largest key) entry in the table without removing it. Return `None` if the table is empty.
+
+### iter
+
+```rust
+fn iter(&self) -> Result<Range<'_, K, V>>
+```
+
+Convenience wrapper equivalent to `self.range(..)`. Iterates every entry in ascending key order.
+
+---
+
+## ReadableTableMetadata trait
+
+Implemented by `Table`, `ReadOnlyTable`, and the untyped handle types.
+
+### len
+
+```rust
+fn len(&self) -> Result<u64>
+```
+
+Returns the number of entries in the table.
+
+### is\_empty
+
+```rust
+fn is_empty(&self) -> Result<bool>
+```
+
+Returns `true` if the table contains no entries.
+
+### stats
+
+```rust
+fn stats(&self) -> Result<TableStats>
+```
+
+Returns detailed storage statistics for the table (see below).
+
+---
+
+## ReadOnlyTable\<K, V\>
+
+Obtained from `ReadTransaction::open_table`. Provides all `ReadableTable` methods. When opened via `ReadOnlyTable::get` or `ReadOnlyTable::range` (the inherent methods rather than the trait methods), the returned `AccessGuard` or `Range` carries a `'static` lifetime and keeps the underlying transaction alive via reference counting, so they can be returned from functions without a lifetime attached to the transaction.
+
+```rust
+let read_txn = db.begin_read()?;
+let table = read_txn.open_table(TABLE)?;
+let guard: AccessGuard<'static, u64> = table.get("hello")?.unwrap();
+// `read_txn` can be dropped; `guard` stays valid
+```
+
+<Note>
+  The inherent `get` and `range` on `ReadOnlyTable` return `'static` guards that keep the transaction alive via `Arc`. The trait-method versions on `ReadableTable` return guards tied to the borrow of the table itself (`'_`).
+</Note>
+
+---
+
+## AccessGuard\<V\>
+
+A zero-copy, scoped reference to a value stored in the database. Released when dropped.
+
+```rust
+pub struct AccessGuard<'a, V: Value + 'static> { /* ... */ }
+```
+
+### value
+
+```rust
+pub fn value(&self) -> V::SelfType<'_>
+```
+
+Deserialises and returns the stored value. For types like `u64` or `&str` this is a direct view into page memory with no heap allocation.
+
+```rust
+let guard = table.get("my_key")?.expect("key exists");
+let v: u64 = guard.value();
+```
+
+<Tip>
+  Hold `AccessGuard` only as long as you need the reference. Retaining many guards simultaneously pins database pages in memory.
+</Tip>
+
+---
+
+## AccessGuardMut\<V\>
+
+Returned by `Table::get_mut`. Allows reading and replacing an existing value.
+
+### value (read)
+
+```rust
+pub fn value(&self) -> V::SelfType<'_>
+```
+
+### insert (replace)
+
+```rust
+pub fn insert<'v>(&mut self, value: impl Borrow<V::SelfType<'v>>) -> Result<()>
+```
+
+Replaces the stored value in-place (or reallocates if the new value is larger).
+
+---
+
+## AccessGuardMutInPlace\<V\>
+
+Returned by `Table::insert_reserve`. Gives raw mutable byte access via `AsMut<V::BaseRefType>`. Only available when `V: MutInPlaceValue`.
+
+---
+
+## Range\<K, V\>
+
+A double-ended iterator over a key range.
+
+```rust
+pub struct Range<'a, K: Key + 'static, V: Value + 'static> { /* ... */ }
+```
+
+`Range` implements both `Iterator` and `DoubleEndedIterator`. Each `next()` or `next_back()` call yields:
+
+```rust
+Result<(AccessGuard<'a, K>, AccessGuard<'a, V>)>
+```
+
+`Range` is `Clone` — cloning it creates an independent cursor at the same position.
+
+```rust
+let mut iter = table.range("b"..)?;
+// forward
+let (k, v) = iter.next().unwrap()?;
+// backward from the end
+let (k2, v2) = iter.next_back().unwrap()?;
+```
+
+---
+
+## ExtractIf\<K, V, F\>
+
+Returned by `Table::extract_if` and `Table::extract_from_if`. Implements `Iterator` and `DoubleEndedIterator`; each item is `Result<(AccessGuard<'a, K>, AccessGuard<'a, V>)>`. Entries are removed from the table only when they are yielded from the iterator.
+
+<Warning>
+  If you drop an `ExtractIf` before consuming it completely, the remaining matching entries are **not** removed.
+</Warning>
+
+---
+
+## TableStats
+
+Informational storage metrics returned by `ReadableTableMetadata::stats()`.
+
+| Method | Return type | Description |
+|---|---|---|
+| `tree_height()` | `u32` | Maximum traversal depth to reach any leaf |
+| `leaf_pages()` | `u64` | Number of leaf pages holding user data |
+| `branch_pages()` | `u64` | Number of internal B-tree branch pages |
+| `stored_bytes()` | `u64` | Bytes consumed by inserted keys and values (no overhead) |
+| `metadata_bytes()` | `u64` | Bytes used by branch-page keys and other internal metadata |
+| `fragmented_bytes()` | `u64` | Bytes lost to internal fragmentation |
+
+```rust
+let stats = table.stats()?;
+println!(
+    "height={} leaves={} stored={}B",
+    stats.tree_height(),
+    stats.leaf_pages(),
+    stats.stored_bytes(),
+);
+```

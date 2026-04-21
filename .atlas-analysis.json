@@ -1,10 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "redb",
+  "projectType": "sdk-library",
+  "projectName": "redb",
+  "projectDescription": "A simple, portable, high-performance, ACID-compliant embedded key-value store written in pure Rust.",
   "theme": "palm",
-  "colors": {
-    "primary": "#CE422B"
-  },
+  "primaryColor": "#CE422B",
+  "lightColor": null,
+  "darkColor": null,
   "navigation": {
     "tabs": [
       {
@@ -85,15 +86,52 @@
       }
     ]
   },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/cberner/redb"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/cberner/redb"
-    }
-  }
+  "keyFeatures": [
+    "Zero-copy, thread-safe BTreeMap-based API",
+    "Fully ACID-compliant transactions",
+    "MVCC for concurrent readers and a single writer without blocking",
+    "Crash-safe by default using checksummed copy-on-write B-trees",
+    "Savepoints and rollbacks (ephemeral and persistent)",
+    "Pluggable storage backends (file and in-memory built-in)",
+    "Multimap tables supporting multiple values per key",
+    "Optional logging and cache metrics features",
+    "Pure Rust with no unsafe dependencies",
+    "Stable file format with upgrade path guarantees"
+  ],
+  "publicApiSurface": [
+    "Database",
+    "Builder",
+    "ReadOnlyDatabase",
+    "ReadableDatabase (trait)",
+    "TableDefinition<K, V>",
+    "MultimapTableDefinition<K, V>",
+    "WriteTransaction",
+    "ReadTransaction",
+    "Table<K, V>",
+    "ReadOnlyTable<K, V>",
+    "ReadableTable (trait)",
+    "MultimapTable<K, V>",
+    "ReadOnlyMultimapTable<K, V>",
+    "ReadableMultimapTable (trait)",
+    "Savepoint",
+    "Durability",
+    "StorageBackend (trait)",
+    "backends::FileBackend",
+    "backends::InMemoryBackend",
+    "Value (trait)",
+    "Key (trait)",
+    "MutInPlaceValue (trait)",
+    "AccessGuard<V>",
+    "AccessGuardMut<V>",
+    "AccessGuardMutInPlace<V>",
+    "Error",
+    "StorageError",
+    "DatabaseError",
+    "TableError",
+    "TransactionError",
+    "CommitError",
+    "SavepointError",
+    "CompactionError",
+    "SetDurabilityError"
+  ]
 }

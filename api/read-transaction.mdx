@@ -1,0 +1,228 @@
+---
+title: "ReadTransaction — redb API reference"
+description: "Complete reference for ReadTransaction, the read-only MVCC snapshot transaction in redb for querying tables without blocking concurrent writers."
+---
+
+`ReadTransaction` provides a consistent, read-only view of the database at the moment it was opened. You obtain one by calling [`Database::begin_read`](/api/database#begin_read). Because redb uses Multi-Version Concurrency Control (MVCC), any number of `ReadTransaction` instances can coexist with an active `WriteTransaction` — readers never block writers and writers never block readers. The snapshot seen by a `ReadTransaction` is fixed at the moment `begin_read` is called and does not change, even if a `WriteTransaction` commits new data while the read transaction is open.
+
+<Note>
+A `ReadTransaction` holds a reference to a specific database snapshot. Pages that belong to that snapshot are not freed until the transaction — and all objects borrowed from it — are dropped. Long-lived read transactions can therefore prevent the database from reclaiming disk space.
+</Note>
+
+---
+
+## MVCC isolation model
+
+Every `ReadTransaction` is assigned to the most-recently committed database state at the time `begin_read` is called. Internally, redb maintains a copy-on-write B-tree; the read transaction holds a reference to the root of that B-tree version. Writes committed by later `WriteTransaction`s do not affect the root seen by an existing `ReadTransaction`.
+
+This means:
+
+- Reads are always consistent: you see an atomic snapshot.
+- No explicit locking is needed on the read path.
+- The trade-off is that old page versions are retained until all read transactions referencing them are closed.
+
+---
+
+## `open_table`
+
+```rust
+pub fn open_table<K: Key + 'static, V: Value + 'static>(
+    &self,
+    definition: TableDefinition<K, V>,
+) -> Result<ReadOnlyTable<K, V>, TableError>
+```
+
+Opens a typed table for read-only access. Unlike `WriteTransaction::open_table`, this method **does not** create the table if it does not exist.
+
+<ParamField path="definition" type="TableDefinition<K, V>" required>
+  A compile-time constant that names the table and encodes its key and value types. Declare it with `TableDefinition::new("name")`.
+</ParamField>
+
+**Errors**
+
+| Variant | Cause |
+|---|---|
+| `TableError::TableDoesNotExist` | No table with the given name exists in this snapshot. |
+| `TableError::TableTypeMismatch` | The table exists but was created with different key or value types. |
+| `TableError::TableIsMultimap` | The name refers to a multimap table. |
+| `TableError::Storage` | Underlying I/O or corruption error. |
+
+```rust
+use redb::{Database, TableDefinition};
+
+const USERS: TableDefinition<u64, &str> = TableDefinition::new("users");
+
+let db = Database::create("my.db")?;
+
+// Write some data first
+let write_txn = db.begin_write()?;
+{
+    let mut table = write_txn.open_table(USERS)?;
+    table.insert(&1, "alice")?;
+}
+write_txn.commit()?;
+
+// Now read it back
+let read_txn = db.begin_read()?;
+let table = read_txn.open_table(USERS)?;
+assert_eq!(table.get(&1)?.unwrap().value(), "alice");
+```
+
+---
+
+## `open_multimap_table`
+
+```rust
+pub fn open_multimap_table<K: Key + 'static, V: Key + 'static>(
+    &self,
+    definition: MultimapTableDefinition<K, V>,
+) -> Result<ReadOnlyMultimapTable<K, V>, TableError>
+```
+
+Opens a typed multimap table for read-only access. The table must already exist.
+
+<ParamField path="definition" type="MultimapTableDefinition<K, V>" required>
+  A compile-time constant created with `MultimapTableDefinition::new("name")`.
+</ParamField>
+
+**Errors** — same variants as [`open_table`](#open_table), with `TableError::TableIsNotMultimap` added if the name refers to a regular table.
+
+```rust
+use redb::MultimapTableDefinition;
+
+const TAGS: MultimapTableDefinition<u64, &str> = MultimapTableDefinition::new("tags");
+
+let read_txn = db.begin_read()?;
+let tags = read_txn.open_multimap_table(TAGS)?;
+for value in tags.get(&1)? {
+    println!("{}", value?.value());
+}
+```
+
+---
+
+## `open_untyped_table`
+
+```rust
+pub fn open_untyped_table(
+    &self,
+    handle: impl TableHandle,
+) -> Result<ReadOnlyUntypedTable, TableError>
+```
+
+Opens a regular table without compile-time type parameters, returning a `ReadOnlyUntypedTable`. This is useful when the key and value types are not known at compile time — for example, when listing and inspecting arbitrary tables by name.
+
+<ParamField path="handle" type="impl TableHandle" required>
+  Any `TableHandle` implementation — typically an `UntypedTableHandle` obtained from `list_tables()`.
+</ParamField>
+
+**Errors** — `TableError::TableDoesNotExist` or `TableError::Storage`.
+
+```rust
+let read_txn = db.begin_read()?;
+for handle in read_txn.list_tables()? {
+    let table = read_txn.open_untyped_table(handle)?;
+    // Iterate raw bytes with table.range(..)
+}
+```
+
+---
+
+## `open_untyped_multimap_table`
+
+```rust
+pub fn open_untyped_multimap_table(
+    &self,
+    handle: impl MultimapTableHandle,
+) -> Result<ReadOnlyUntypedMultimapTable, TableError>
+```
+
+Opens a multimap table without compile-time type parameters. Analogous to [`open_untyped_table`](#open_untyped_table) for multimap tables.
+
+<ParamField path="handle" type="impl MultimapTableHandle" required>
+  Any `MultimapTableHandle` — typically obtained from `list_multimap_tables()`.
+</ParamField>
+
+---
+
+## `list_tables`
+
+```rust
+pub fn list_tables(&self) -> Result<impl Iterator<Item = UntypedTableHandle>>
+```
+
+Returns an iterator over the names of all regular (non-multimap) tables present in this snapshot. The iteration order is deterministic (sorted by name).
+
+```rust
+let read_txn = db.begin_read()?;
+for handle in read_txn.list_tables()? {
+    println!("table: {}", handle.name());
+}
+```
+
+---
+
+## `list_multimap_tables`
+
+```rust
+pub fn list_multimap_tables(&self) -> Result<impl Iterator<Item = UntypedMultimapTableHandle>>
+```
+
+Returns an iterator over the names of all multimap tables in this snapshot.
+
+```rust
+let read_txn = db.begin_read()?;
+for handle in read_txn.list_multimap_tables()? {
+    println!("multimap table: {}", handle.name());
+}
+```
+
+---
+
+## `close`
+
+```rust
+pub fn close(self) -> Result<(), TransactionError>
+```
+
+Explicitly closes the transaction and verifies that no objects still hold a reference to it. Because `ReadTransaction` implements `Drop`, this method is not required — you can simply drop the transaction. It exists as a convenience for detecting reference leaks early.
+
+**Errors**
+
+| Variant | Cause |
+|---|---|
+| `TransactionError::ReadTransactionStillInUse` | A `ReadOnlyTable` or other object borrowed from this transaction is still alive. The `Box<ReadTransaction>` is returned inside the error so the caller retains ownership. |
+
+```rust
+let read_txn = db.begin_read()?;
+let table = read_txn.open_table(USERS)?;
+drop(table); // Must drop the table first
+
+read_txn.close()?; // Returns error if any borrow is still live
+```
+
+<Tip>
+`close` is particularly useful in tests or long-running processes where you want to assert that a transaction is truly finished and not being held open accidentally.
+</Tip>
+
+---
+
+## Lifetime and borrow rules
+
+Objects returned from a `ReadTransaction` — such as `ReadOnlyTable` and iterators — borrow the transaction for their lifetime. This is enforced statically by the Rust borrow checker:
+
+```rust
+let read_txn = db.begin_read()?;
+let table = read_txn.open_table(USERS)?;
+
+// This does NOT compile: read_txn is borrowed by `table`
+// drop(read_txn);
+
+assert_eq!(table.get(&1)?.unwrap().value(), "alice");
+drop(table); // Release the borrow
+
+// Now this is fine
+drop(read_txn);
+```
+
+The one exception is `close()`, which explicitly checks the reference count at runtime and returns an error if any borrows are still live, rather than relying solely on compile-time lifetimes.

@@ -1,97 +1,110 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "redb: embedded key-value store for Rust"
+description: "redb is an ACID-compliant embedded key-value store written in pure Rust. Zero-copy reads, MVCC concurrency, crash-safe by default, no external dependencies."
 ---
 
-## Setting up
+redb is an embedded key-value database written in pure Rust. It stores data in a collection of copy-on-write B-trees and provides fully ACID-compliant transactions, zero-copy reads, and MVCC-based concurrency — all with no external dependencies.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Write your first redb database in under five minutes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Installation" icon="box" href="/installation">
+    Add redb to your Cargo.toml and configure optional features
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Core Concepts" icon="book" href="/concepts/databases-and-tables">
+    Understand databases, tables, transactions, and the type system
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/database">
+    Full reference for every public type and method
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why redb?
 
-Everything you need to create world-class documentation.
+redb is designed for applications that need an embedded database without the complexity of a client-server setup. It is loosely inspired by [lmdb](http://www.lmdb.tech/doc/) but written entirely in safe Rust with a modern, ergonomic API.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={2}>
+  <Card title="ACID transactions" icon="shield-check">
+    Every write is atomic, consistent, isolated, and durable. Transactions either commit fully or roll back completely.
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="MVCC concurrency" icon="arrows-split-up-and-left">
+    Multiple readers run concurrently alongside a single writer, with no blocking between them.
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="Zero-copy reads" icon="bolt">
+    Data is accessed directly from the memory-mapped file — no deserialization overhead for reads.
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="Crash safety" icon="circle-check">
+    All pages are checksummed. Partially-written transactions are detected and rolled back on next open.
   </Card>
-</Columns>
+  <Card title="Savepoints" icon="bookmark">
+    Create named snapshots of database state and roll back to them at any time, even across restarts.
+  </Card>
+  <Card title="Custom backends" icon="plug">
+    Swap out the storage layer with your own implementation of the `StorageBackend` trait.
+  </Card>
+</CardGroup>
 
-## Need inspiration?
+## Quick example
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+```rust quickstart.rs
+use redb::{Database, Error, ReadableDatabase, TableDefinition};
+
+const TABLE: TableDefinition<&str, u64> = TableDefinition::new("my_data");
+
+fn main() -> Result<(), Error> {
+    let db = Database::create("my_db.redb")?;
+
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(TABLE)?;
+        table.insert("my_key", &123)?;
+    }
+    write_txn.commit()?;
+
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(TABLE)?;
+    assert_eq!(table.get("my_key")?.unwrap().value(), 123);
+
+    Ok(())
+}
+```
+
+## Get started
+
+<Steps>
+  <Step title="Add redb to your project">
+    Add the dependency to `Cargo.toml`:
+    ```toml
+    [dependencies]
+    redb = "4"
+    ```
+  </Step>
+  <Step title="Define your tables">
+    Declare typed table definitions at compile time:
+    ```rust
+    use redb::TableDefinition;
+    const USERS: TableDefinition<u64, &str> = TableDefinition::new("users");
+    ```
+  </Step>
+  <Step title="Open a database and write data">
+    Create a database file, start a write transaction, and insert records:
+    ```rust
+    let db = Database::create("app.redb")?;
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(USERS)?;
+        table.insert(&1, "Alice")?;
+    }
+    txn.commit()?;
+    ```
+  </Step>
+  <Step title="Read data back">
+    Open a read transaction and query your table:
+    ```rust
+    let txn = db.begin_read()?;
+    let table = txn.open_table(USERS)?;
+    println!("{}", table.get(&1)?.unwrap().value());
+    ```
+  </Step>
+</Steps>

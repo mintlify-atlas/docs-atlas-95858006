@@ -1,0 +1,323 @@
+---
+title: "Types and value traits — redb type system"
+description: "Complete reference for the Value, Key, and MutInPlaceValue traits, all built-in types, TypeName, AccessGuard, Durability, and DatabaseStats in redb."
+---
+
+redb's type system is built around a small set of traits that control how values are serialized to and deserialized from raw bytes. Every key and value stored in a redb table must implement at least `Value`; types used as keys must additionally implement `Key`. The library ships built-in implementations for all common Rust primitives, slices, and strings, and you can add your own by implementing these traits.
+
+## `Value` trait
+
+`Value` is the foundational trait. Any type that implements it can be stored as a value in a redb table. Implementations control serialization format and must ensure `as_bytes` and `from_bytes` are perfect inverses of each other.
+
+```rust
+pub trait Value: Debug {
+    /// The concrete type returned by `from_bytes`. Must be `Self` with all
+    /// lifetimes replaced by `'a`, enabling zero-copy borrows from the page.
+    type SelfType<'a>: Debug + 'a where Self: 'a;
+
+    /// The byte representation produced by `as_bytes`.
+    type AsBytes<'a>: AsRef<[u8]> + 'a where Self: 'a;
+
+    /// Fixed serialized width in bytes, or `None` for variable-width types.
+    fn fixed_width() -> Option<usize>;
+
+    /// Deserialize a value from a raw byte slice.
+    /// Implementations may return a zero-copy view (e.g. `&'a str`) or an
+    /// owned value (e.g. `String`).
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a> where Self: 'a;
+
+    /// Serialize a value to bytes.
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
+    where Self: 'b;
+
+    /// Globally unique identifier for this type, stored in the database file.
+    fn type_name() -> TypeName;
+}
+```
+
+<Warning>
+`from_bytes` is called with data that redb trusts to be the output of a prior `as_bytes` call for the same type. If you implement `Value` on a custom type, ensure the two functions are strict inverses — redb does **not** validate the raw bytes before calling `from_bytes`.
+</Warning>
+
+### Implementing `Value` for a custom type
+
+```rust
+use redb::{Key, TypeName, Value};
+use std::cmp::Ordering;
+
+#[derive(Debug)]
+struct UserId(u32);
+
+impl Value for UserId {
+    type SelfType<'a> = UserId;
+    type AsBytes<'a> = [u8; 4];
+
+    fn fixed_width() -> Option<usize> { Some(4) }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> UserId where Self: 'a {
+        UserId(u32::from_le_bytes(data.try_into().unwrap()))
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a UserId) -> [u8; 4] where Self: 'b {
+        value.0.to_le_bytes()
+    }
+
+    fn type_name() -> TypeName {
+        // Prefix with your crate name to avoid collisions
+        TypeName::new("my_crate::UserId")
+    }
+}
+```
+
+---
+
+## `Key` trait
+
+`Key` extends `Value` and adds a comparison function. Any type implementing `Key` can be used as the key type in a table definition. The comparison must define a total order.
+
+```rust
+pub trait Key: Value {
+    /// Compare two serialized byte representations.
+    /// Must define a total order consistent with the in-memory ordering of values.
+    fn compare(data1: &[u8], data2: &[u8]) -> Ordering;
+}
+```
+
+<Note>
+`f32` and `f64` intentionally do **not** implement `Key` because IEEE 754 floating-point values do not define a total order (`NaN != NaN`). Use integer bit-cast representations if you need float keys.
+</Note>
+
+### Extending the custom type example to a key
+
+```rust
+impl Key for UserId {
+    fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
+        let a = u32::from_le_bytes(data1.try_into().unwrap());
+        let b = u32::from_le_bytes(data2.try_into().unwrap());
+        a.cmp(&b)
+    }
+}
+```
+
+---
+
+## `MutInPlaceValue` trait
+
+`MutInPlaceValue` refines `Value` for types whose in-memory layout is the same as their serialized layout, so a mutable reference to the raw page bytes can be safely reinterpreted without a copy. Implementing this trait unlocks the `Table::insert_reserve` method, which reserves space in the B-tree and hands back a mutable reference that the caller fills directly.
+
+```rust
+pub trait MutInPlaceValue: Value {
+    /// The base type such that `&mut [u8]` can be safely transmuted to
+    /// `&mut BaseRefType`. For byte slices this is `[u8]`.
+    type BaseRefType: Debug + ?Sized;
+
+    /// Initialize `data` to any valid serialized form before handing it to the
+    /// caller. Called once before the first `from_bytes_mut` on the reservation.
+    fn initialize(data: &mut [u8]);
+
+    /// Reinterpret the raw bytes as a mutable reference to `BaseRefType`.
+    fn from_bytes_mut(data: &mut [u8]) -> &mut Self::BaseRefType;
+}
+```
+
+The only built-in implementation is `&[u8]`, whose `BaseRefType` is `[u8]` and whose `initialize` is a no-op because every byte pattern is a valid `&[u8]`.
+
+---
+
+## `TypeName` struct
+
+`TypeName` is an opaque wrapper around a string identifier that is persisted in the database file alongside every table's key and value types. When a table is reopened with a different type parameter, redb compares `TypeName` values and returns `TableError::TableTypeMismatch` if they differ.
+
+```rust
+impl TypeName {
+    /// Create a user-defined type name.
+    /// Prefix `name` with your crate name to avoid collisions with other
+    /// user-defined types or future built-in types.
+    pub fn new(name: &str) -> Self;
+
+    /// Return the raw name string.
+    pub fn name(&self) -> &str;
+}
+```
+
+<Tip>
+Use a fully qualified path as the name, e.g. `"my_crate::model::EventId"`. This avoids silent type confusion if two unrelated crates happen to use the same short name.
+</Tip>
+
+---
+
+## `AccessGuard<V>`
+
+`AccessGuard<'a, V>` is a scoped handle to a value stored in a B-tree page. It is returned by read operations such as `ReadableTable::get` and `ReadableTable::range`. The value can be read through the guard without copying it out of the page.
+
+```rust
+impl<'a, V: Value + 'static> AccessGuard<'a, V> {
+    /// Deserialize and return the stored value.
+    /// For types like `&str` or `&[u8]` this is a zero-copy borrow;
+    /// for types like `String` this allocates.
+    pub fn value(&self) -> V::SelfType<'_>;
+}
+```
+
+When the `AccessGuard` is dropped the underlying page reference is released.
+
+```rust
+let read_txn = db.begin_read()?;
+let table = read_txn.open_table(TABLE)?;
+
+// guard borrows the page; the string slice lives as long as guard
+if let Some(guard) = table.get("hello")? {
+    let s: &str = guard.value();
+    println!("{s}");
+} // guard dropped here, page released
+```
+
+---
+
+## `AccessGuardMut<V>`
+
+`AccessGuardMut<'a, V>` is the mutable counterpart returned by `Table::remove` (the removed entry is kept accessible until the guard is dropped, at which point the entry is actually deleted from the tree). It exposes the same `.value()` accessor.
+
+```rust
+impl<'a, V: Value + 'static> AccessGuardMut<'a, V> {
+    pub fn value(&self) -> V::SelfType<'_>;
+}
+```
+
+---
+
+## `AccessGuardMutInPlace<V>`
+
+`AccessGuardMutInPlace<'a, V>` is returned by `Table::insert_reserve`. It gives direct mutable access to the reserved bytes inside the B-tree page, avoiding a copy for large values. The type implements `AsMut<V::BaseRefType>` when `V: MutInPlaceValue`.
+
+```rust
+// Reserve 1024 bytes for a large byte-slice value and fill it in-place
+let mut guard = table.insert_reserve("key", 1024)?;
+guard.as_mut().fill(0xAB);
+// guard drop commits the write
+```
+
+---
+
+## Built-in `Value` implementations
+
+All of the following types implement `Value` out of the box. Integer and float types use little-endian byte order.
+
+| Type | Width | Notes |
+|------|-------|-------|
+| `u8` | 1 | |
+| `u16` | 2 | |
+| `u32` | 4 | |
+| `u64` | 8 | |
+| `u128` | 16 | |
+| `i8` | 1 | |
+| `i16` | 2 | |
+| `i32` | 4 | |
+| `i64` | 8 | |
+| `i128` | 16 | |
+| `f32` | 4 | Not `Key` — no total order |
+| `f64` | 8 | Not `Key` — no total order |
+| `bool` | 1 | `0` = false, `1` = true |
+| `char` | 3 | Little-endian Unicode scalar |
+| `()` | 0 | Unit / marker type |
+| `&str` | variable | UTF-8; zero-copy borrow |
+| `String` | variable | UTF-8; owned |
+| `&[u8]` | variable | Zero-copy borrow |
+| `&[u8; N]` | `N` | Fixed-width; zero-copy borrow |
+| `[T; N]` | variable or `N * T::fixed_width()` | Array of any `Value` |
+| `Option<T>` | variable or `T::fixed_width() + 1` | `None` sorts before `Some` |
+
+---
+
+## Built-in `Key` implementations
+
+The following subset of built-in types additionally implements `Key` and can be used as table key types. All use their natural ordering.
+
+| Type | Ordering |
+|------|---------|
+| `u8` | Numeric ascending |
+| `u16` | Numeric ascending |
+| `u32` | Numeric ascending |
+| `u64` | Numeric ascending |
+| `u128` | Numeric ascending |
+| `i8` | Numeric ascending (signed) |
+| `i16` | Numeric ascending (signed) |
+| `i32` | Numeric ascending (signed) |
+| `i64` | Numeric ascending (signed) |
+| `i128` | Numeric ascending (signed) |
+| `bool` | `false` < `true` |
+| `char` | Unicode scalar value ascending |
+| `()` | All values equal |
+| `&str` | Lexicographic |
+| `String` | Lexicographic |
+| `&[u8]` | Lexicographic |
+| `&[u8; N]` | Lexicographic |
+| `[T; N]` | Element-wise, using `T`'s ordering |
+| `Option<T>` | `None` < `Some(_)`, then by `T` |
+
+<Note>
+`f32` and `f64` are **not** in this table. They implement `Value` but not `Key`.
+</Note>
+
+---
+
+## `Durability` enum
+
+`Durability` controls the persistence guarantee of a write transaction. Set it via `WriteTransaction::set_durability` before calling `commit`.
+
+```rust
+#[non_exhaustive]
+pub enum Durability {
+    /// Commits are not guaranteed to survive a crash or power loss unless
+    /// followed by a subsequent `Durability::Immediate` commit.
+    /// Offers the best write throughput.
+    None,
+
+    /// Commits are durable as soon as `WriteTransaction::commit` returns.
+    /// Data is flushed to the OS and an `fsync` is issued before returning.
+    Immediate,
+}
+```
+
+```rust
+let write_txn = db.begin_write()?;
+write_txn.set_durability(Durability::None)?;
+{
+    let mut table = write_txn.open_table(TABLE)?;
+    table.insert("key", &value)?;
+}
+write_txn.commit()?;
+```
+
+<Warning>
+`Durability::None` commits may be silently rolled back after a crash. If you use it for bulk-loading, finish with at least one `Durability::Immediate` commit to make all preceding writes durable.
+</Warning>
+
+---
+
+## `DatabaseStats` struct
+
+`DatabaseStats` is returned by `WriteTransaction::stats` and provides diagnostic information about the internal B-tree structure of the database.
+
+| Method | Return type | Description |
+|--------|------------|-------------|
+| `tree_height()` | `u32` | Maximum traversal depth to reach any leaf across all tables |
+| `allocated_pages()` | `u64` | Total number of pages allocated in the file |
+| `leaf_pages()` | `u64` | Pages that store user key-value pairs |
+| `branch_pages()` | `u64` | Internal B-tree index pages |
+| `stored_bytes()` | `u64` | Bytes used by inserted keys and values (excludes indexing overhead) |
+| `metadata_bytes()` | `u64` | Bytes used by branch-page keys and other internal metadata |
+| `fragmented_bytes()` | `u64` | Bytes lost to fragmentation in data pages and internal tables |
+| `page_size()` | `usize` | Bytes per page (configured at database creation time) |
+
+```rust
+let write_txn = db.begin_write()?;
+let stats = write_txn.stats()?;
+println!(
+    "height={} pages={} stored={}B fragmented={}B",
+    stats.tree_height(),
+    stats.allocated_pages(),
+    stats.stored_bytes(),
+    stats.fragmented_bytes(),
+);
+```

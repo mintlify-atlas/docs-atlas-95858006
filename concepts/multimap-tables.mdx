@@ -1,0 +1,190 @@
+---
+title: "Multimap tables: multiple values per key"
+description: "Learn how redb multimap tables store multiple ordered values per key, how to insert, query, and remove values, and how MultimapRange and MultimapValue work."
+---
+
+A multimap table is a table where each key can map to more than one value. Unlike a standard table—where inserting a key replaces its previous value—inserting into a multimap table adds to the set of values associated with that key. This page explains how to define and open multimap tables, insert and remove values, iterate over a key's values, and use range queries.
+
+## Defining a multimap table
+
+Multimap tables are described by `MultimapTableDefinition<K, V>`. Both `K` and `V` must implement the `Key` trait (not just `Value`), because redb stores each key's values in a sorted B-tree subtree and needs to compare them:
+
+```rust
+use redb::MultimapTableDefinition;
+
+// A table mapping &str keys to u64 values, with multiple values per key
+const TAGS: MultimapTableDefinition<&str, u64> = MultimapTableDefinition::new("tags");
+```
+
+`MultimapTableDefinition` is `Copy` and can be declared as a module-level constant, exactly like `TableDefinition`.
+
+## Opening a multimap table in a write transaction
+
+Call `WriteTransaction::open_multimap_table` with the definition. The table is created if it does not exist:
+
+```rust
+use redb::{Database, Error, MultimapTableDefinition, ReadableDatabase};
+
+const TAGS: MultimapTableDefinition<&str, u64> = MultimapTableDefinition::new("tags");
+
+fn main() -> Result<(), Error> {
+    let db = Database::create("multimap.redb")?;
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_multimap_table(TAGS)?;
+
+        // Each insert adds a value to the key's set
+        table.insert("rust", &2015)?;
+        table.insert("rust", &2021)?;
+        table.insert("python", &3)?;
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+```
+
+`MultimapTable::insert` returns `true` if the exact key-value pair was already present, and `false` if it was added. Inserting the same pair twice is a no-op—multimap tables store sets of values, not multisets.
+
+## Reading values for a key
+
+Use `get` on a `MultimapTable` (or `ReadOnlyMultimapTable`) to retrieve all values associated with a key. It returns a `MultimapValue<'_, V>` iterator that yields values in ascending order:
+
+```rust
+use redb::{ReadableDatabase, ReadableMultimapTable};
+
+let read_txn = db.begin_read()?;
+let table = read_txn.open_multimap_table(TAGS)?;
+
+let mut values = table.get("rust")?;
+while let Some(result) = values.next() {
+    let guard = result?;
+    println!("rust: {}", guard.value()); // prints 2015, then 2021
+}
+```
+
+`MultimapValue` implements `Iterator<Item = Result<AccessGuard<'_, V>>>` and `DoubleEndedIterator`, so you can also iterate from the back. It exposes a `len()` method that returns the number of remaining items without consuming them.
+
+## Range queries with MultimapRange
+
+`ReadableMultimapTable::range` scans a range of keys and returns a `MultimapRange<'_, K, V>` iterator. Each item is a `(AccessGuard<'_, K>, MultimapValue<'_, V>)` pair:
+
+```rust
+use redb::{ReadableDatabase, ReadableMultimapTable};
+
+let read_txn = db.begin_read()?;
+let table = read_txn.open_multimap_table(TAGS)?;
+
+// Iterate over all keys between "p" and "s" (exclusive upper bound)
+for result in table.range("p".."s")? {
+    let (key, mut values) = result?;
+    print!("{}: ", key.value());
+    for v in &mut values {
+        print!("{} ", v?.value());
+    }
+    println!();
+}
+// Output: python: 3
+```
+
+`MultimapRange` also implements `DoubleEndedIterator`, so reverse iteration works with `.rev()` or `next_back()`.
+
+## Removing values
+
+There are two removal operations on `MultimapTable`:
+
+**`remove(key, value)`** removes a single specific value from a key's set. It returns `true` if the pair existed:
+
+```rust
+let write_txn = db.begin_write()?;
+{
+    let mut table = write_txn.open_multimap_table(TAGS)?;
+    let was_present = table.remove("rust", &2015)?;
+    assert!(was_present);
+}
+write_txn.commit()?;
+```
+
+**`remove_all(key)`** removes all values for a key and returns a `MultimapValue` iterator over the removed values. Values are in ascending order:
+
+```rust
+let write_txn = db.begin_write()?;
+{
+    let mut table = write_txn.open_multimap_table(TAGS)?;
+    let removed = table.remove_all("rust")?;
+    for result in removed {
+        println!("removed: {}", result?.value());
+    }
+}
+write_txn.commit()?;
+```
+
+<Note>
+Values returned by `remove_all` are freed from storage only after the iterator is dropped (or fully consumed). Holding on to the iterator while making other writes in the same transaction is safe, but the pages backing those values remain alive until the iterator is dropped.
+</Note>
+
+## Opening a multimap table for reading
+
+In a `ReadTransaction`, use `open_multimap_table` to get a `ReadOnlyMultimapTable`. The API is the same as the mutable version except that `insert`, `remove`, and `remove_all` are not available:
+
+```rust
+use redb::{MultimapTableDefinition, ReadableDatabase, ReadableMultimapTable};
+
+const TAGS: MultimapTableDefinition<&str, u64> = MultimapTableDefinition::new("tags");
+
+fn print_all_tags(db: &redb::Database) -> Result<(), redb::Error> {
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_multimap_table(TAGS)?;
+
+    for result in table.range::<&str>(..)? {
+        let (key, values) = result?;
+        let vals: Vec<u64> = values
+            .map(|r| r.map(|g| g.value()))
+            .collect::<Result<_, _>>()?;
+        println!("{}: {:?}", key.value(), vals);
+    }
+    Ok(())
+}
+```
+
+## Complete example
+
+The following example builds a reverse index mapping topic tags to document IDs, inserts several entries, and then looks up all documents tagged with a given topic:
+
+```rust
+use redb::{Database, Error, MultimapTableDefinition, ReadableDatabase, ReadableMultimapTable};
+
+const INDEX: MultimapTableDefinition<&str, u64> =
+    MultimapTableDefinition::new("tag_to_doc_ids");
+
+fn main() -> Result<(), Error> {
+    let db = Database::create("index.redb")?;
+
+    // Index three documents
+    let write_txn = db.begin_write()?;
+    {
+        let mut index = write_txn.open_multimap_table(INDEX)?;
+        index.insert("database", &1)?;
+        index.insert("database", &3)?;
+        index.insert("rust",     &1)?;
+        index.insert("rust",     &2)?;
+        index.insert("embedded", &2)?;
+        index.insert("embedded", &3)?;
+    }
+    write_txn.commit()?;
+
+    // Look up all docs tagged "rust"
+    let read_txn = db.begin_read()?;
+    let index = read_txn.open_multimap_table(INDEX)?;
+    let mut rust_docs = index.get("rust")?;
+    println!("docs tagged 'rust': {} total", rust_docs.len());
+    while let Some(result) = rust_docs.next() {
+        println!("  doc id: {}", result?.value());
+    }
+
+    Ok(())
+}
+```
+
+<Tip>
+Multimap tables are well-suited for inverted indexes, adjacency lists in graphs, and any other relationship where one entity has an ordered set of associated values. Because the values are stored in a sorted B-tree, range queries over values (e.g., "all doc IDs between 10 and 100 for this tag") are efficient.
+</Tip>

@@ -1,0 +1,168 @@
+---
+title: "Implementing a custom storage backend"
+description: "Implement the StorageBackend trait to store a redb database in memory, over a network, or any custom medium. Covers FileBackend and InMemoryBackend."
+---
+
+redb separates the database engine from the underlying storage through the `StorageBackend` trait. By default redb ships with `FileBackend` for on-disk storage and `InMemoryBackend` for ephemeral in-memory storage. If you need to store the database on a different medium — an encrypted file, a network-mounted volume, a custom byte buffer, or anything else — you can implement `StorageBackend` yourself and pass it to `Builder::create_with_backend`.
+
+## The `StorageBackend` trait
+
+The trait is defined in `src/db.rs` and requires six methods:
+
+```rust
+pub trait StorageBackend: 'static + Debug + Send + Sync {
+    /// Gets the current length of the storage in bytes.
+    fn len(&self) -> std::result::Result<u64, io::Error>;
+
+    /// Reads bytes from the storage at the given byte offset.
+    ///
+    /// Must return an error if `offset + out.len()` exceeds the storage length.
+    fn read(&self, offset: u64, out: &mut [u8]) -> std::result::Result<(), io::Error>;
+
+    /// Sets the total length of the storage.
+    ///
+    /// New positions must be zero-initialized.
+    fn set_len(&self, len: u64) -> std::result::Result<(), io::Error>;
+
+    /// Flushes all buffered writes to the persistent medium.
+    fn sync_data(&self) -> std::result::Result<(), io::Error>;
+
+    /// Writes a byte slice at the given offset.
+    fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), io::Error>;
+
+    /// Called exactly once when the Database is dropped; release resources here.
+    ///
+    /// redb will never access the backend after this call.
+    fn close(&self) -> std::result::Result<(), io::Error> {
+        Ok(())
+    }
+}
+```
+
+All methods take `&self`, so interior mutability (e.g. `Mutex`, `RwLock`) is required for implementations that mutate state. The trait also requires `Send + Sync + 'static`, which means the backend must be safe to share across threads and must not hold references with shorter lifetimes.
+
+## Built-in backends
+
+### `FileBackend`
+
+`FileBackend` wraps a `std::fs::File` and uses `pwrite`/`pread` (or platform equivalents) for all I/O. It is the default backend used by `Database::create` and `Database::open`.
+
+### `InMemoryBackend`
+
+`InMemoryBackend` stores everything in a `Vec<u8>` guarded by an `RwLock`. It is fully in-memory and therefore non-durable — data is lost when the `Database` is dropped. It is useful for tests and caches.
+
+```rust
+use redb::{Builder, Database};
+use redb::backends::InMemoryBackend;
+
+fn main() -> Result<(), redb::Error> {
+    let db = Builder::new().create_with_backend(InMemoryBackend::new())?;
+    // Use `db` exactly like a file-backed database
+    Ok(())
+}
+```
+
+## Implementing a custom backend
+
+The example below shows a minimal skeleton wrapping a `Vec<u8>` with a `Mutex`. You can adapt this pattern for any byte-addressable storage.
+
+```rust
+use redb::StorageBackend;
+use std::io;
+use std::sync::Mutex;
+
+#[derive(Debug)]
+pub struct VecBackend {
+    data: Mutex<Vec<u8>>,
+}
+
+impl VecBackend {
+    pub fn new() -> Self {
+        Self {
+            data: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl StorageBackend for VecBackend {
+    fn len(&self) -> Result<u64, io::Error> {
+        Ok(self.data.lock().unwrap().len() as u64)
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), io::Error> {
+        let guard = self.data.lock().unwrap();
+        let offset = offset as usize;
+        if offset + out.len() <= guard.len() {
+            out.copy_from_slice(&guard[offset..offset + out.len()]);
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::InvalidInput, "read out of range"))
+        }
+    }
+
+    fn set_len(&self, len: u64) -> Result<(), io::Error> {
+        self.data.lock().unwrap().resize(len as usize, 0);
+        Ok(())
+    }
+
+    fn sync_data(&self) -> Result<(), io::Error> {
+        // No-op for an in-memory backend
+        Ok(())
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), io::Error> {
+        let mut guard = self.data.lock().unwrap();
+        let offset = offset as usize;
+        if offset + data.len() <= guard.len() {
+            guard[offset..offset + data.len()].copy_from_slice(data);
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::InvalidInput, "write out of range"))
+        }
+    }
+
+    fn close(&self) -> Result<(), io::Error> {
+        // Nothing to flush or release for an in-memory buffer
+        Ok(())
+    }
+}
+```
+
+## Opening a database with a custom backend
+
+Pass your backend to `Builder::create_with_backend`:
+
+```rust
+use redb::{Builder, TableDefinition};
+
+const TABLE: TableDefinition<u64, &str> = TableDefinition::new("items");
+
+fn main() -> Result<(), redb::Error> {
+    let db = Builder::new().create_with_backend(VecBackend::new())?;
+
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(TABLE)?;
+        table.insert(&1, "hello")?;
+    }
+    txn.commit()?;
+
+    let txn = db.begin_read()?;
+    let table = txn.open_table(TABLE)?;
+    println!("{:?}", table.get(&1)?.unwrap().value());
+
+    Ok(())
+}
+```
+
+<Note>
+`sync_data` is called by redb during every `Durability::Immediate` commit to guarantee durability. For backends where data is inherently ephemeral (such as a pure in-memory buffer), it is safe to make `sync_data` a no-op, but commits will then have no persistence guarantee in the event of a crash.
+</Note>
+
+## Implementation checklist
+
+- `read` must return an error if `offset + out.len()` exceeds the storage length; redb relies on this to detect corruption.
+- `set_len` with a larger value must zero-initialize the new bytes.
+- All methods take `&self`, so use interior mutability for any mutable state.
+- The type must implement `Debug`, `Send`, and `Sync`.
+- `close` is called **exactly once** when the `Database` is dropped. Do not access the backend after that point.

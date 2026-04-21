@@ -1,0 +1,284 @@
+---
+title: "MultimapTable — multiple values per key"
+description: "API reference for MultimapTable<K,V> and ReadOnlyMultimapTable<K,V>: insert, remove, and iterate over multiple values per key in redb multimap tables."
+---
+
+`MultimapTable<K, V>` is the writable handle for a [multimap table](https://en.wikipedia.org/wiki/Multimap) — a table where each key can have an arbitrary number of associated values stored in sorted order. It is obtained from a `WriteTransaction` via `open_multimap_table`. The companion `ReadOnlyMultimapTable<K, V>` provides the same read methods from a `ReadTransaction`. Both implement the `ReadableMultimapTable` trait.
+
+<Note>
+  Both `K` and `V` must implement the `Key` trait (not just `Value`) because values within a multimap entry are themselves stored in a B-tree keyed by their serialised bytes. This means values must have a defined ordering and cannot be zero-sized.
+</Note>
+
+## MultimapTable\<K, V\>
+
+A writable multimap table scoped to a `WriteTransaction`. The total number of key-value pairs (across all keys) is tracked in `len()`.
+
+```rust
+use redb::{Database, MultimapTableDefinition};
+
+const TABLE: MultimapTableDefinition<&str, u64> =
+    MultimapTableDefinition::new("events");
+
+let db = Database::create("my.db")?;
+let write_txn = db.begin_write()?;
+{
+    let mut table = write_txn.open_multimap_table(TABLE)?;
+    table.insert("user:1", &10)?;
+    table.insert("user:1", &20)?;
+    table.insert("user:1", &30)?;
+}
+write_txn.commit()?;
+```
+
+### insert
+
+```rust
+pub fn insert<'k, 'v>(
+    &mut self,
+    key: impl Borrow<K::SelfType<'k>>,
+    value: impl Borrow<V::SelfType<'v>>,
+) -> Result<bool>
+```
+
+Adds `value` to the set of values associated with `key`. Returns `true` if the exact key-value pair already existed (and is therefore a no-op), or `false` if it was freshly inserted.
+
+<ParamField path="key" type="impl Borrow<K::SelfType<'k>>">
+  The key to insert the value under.
+</ParamField>
+
+<ParamField path="value" type="impl Borrow<V::SelfType<'v>>">
+  The value to add. Duplicates for the same key are silently ignored.
+</ParamField>
+
+<Warning>
+  Returns `Err(StorageError::ValueTooLarge)` if the serialised key or value is too large, or if their combined size exceeds `MAX_PAIR_LENGTH`.
+</Warning>
+
+### remove
+
+```rust
+pub fn remove<'k, 'v>(
+    &mut self,
+    key: impl Borrow<K::SelfType<'k>>,
+    value: impl Borrow<V::SelfType<'v>>,
+) -> Result<bool>
+```
+
+Removes a single key-value pair. Returns `true` if the pair was present and removed, `false` if it did not exist.
+
+<ParamField path="key" type="impl Borrow<K::SelfType<'k>>">
+  The key whose value set should be modified.
+</ParamField>
+
+<ParamField path="value" type="impl Borrow<V::SelfType<'v>>">
+  The specific value to remove from that key's set.
+</ParamField>
+
+### remove\_all
+
+```rust
+pub fn remove_all<'a>(
+    &mut self,
+    key: impl Borrow<K::SelfType<'a>>,
+) -> Result<MultimapValue<'_, V>>
+```
+
+Removes **all** values for `key` and returns an iterator over them in ascending order. If no values were stored for `key`, the iterator is empty.
+
+<ParamField path="key" type="impl Borrow<K::SelfType<'a>>">
+  The key whose entire value set should be removed.
+</ParamField>
+
+```rust
+let removed: Vec<_> = table
+    .remove_all("user:1")?
+    .collect::<Result<_, _>>()?;
+// `removed` contains AccessGuard values in ascending order
+```
+
+<Warning>
+  The underlying pages are freed only after the `MultimapValue` iterator is dropped. Hold the iterator only as long as needed.
+</Warning>
+
+---
+
+## ReadableMultimapTable\<K, V\> trait
+
+Implemented by both `MultimapTable<K, V>` and `ReadOnlyMultimapTable<K, V>`.
+
+### get
+
+```rust
+fn get<'a>(
+    &self,
+    key: impl Borrow<K::SelfType<'a>>,
+) -> Result<MultimapValue<'_, V>>
+```
+
+Returns an iterator over all values associated with `key` in ascending order. If no values exist for `key`, the iterator is empty (`len() == 0`).
+
+```rust
+let read_txn = db.begin_read()?;
+let table = read_txn.open_multimap_table(TABLE)?;
+for result in table.get("user:1")? {
+    let guard = result?;
+    println!("{}", guard.value());
+}
+```
+
+### range
+
+```rust
+fn range<'a, KR>(
+    &self,
+    range: impl RangeBounds<KR> + 'a,
+) -> Result<MultimapRange<'_, K, V>>
+where
+    KR: Borrow<K::SelfType<'a>> + 'a,
+```
+
+Returns a double-ended `MultimapRange` iterator over all keys in the specified range. Each item yields the key plus a `MultimapValue` iterator over that key's values.
+
+```rust
+for result in table.range("user:1"..="user:9")? {
+    let (key_guard, values) = result?;
+    print!("{}: ", key_guard.value());
+    for v in values {
+        print!("{} ", v?.value());
+    }
+    println!();
+}
+```
+
+### iter
+
+```rust
+fn iter(&self) -> Result<MultimapRange<'_, K, V>>
+```
+
+Convenience equivalent to `self.range(..)`. Iterates all entries in ascending key order.
+
+---
+
+## ReadableTableMetadata trait
+
+Both multimap table types implement `ReadableTableMetadata`.
+
+### len
+
+```rust
+fn len(&self) -> Result<u64>
+```
+
+Returns the total number of key-value pairs across all keys.
+
+### is\_empty
+
+```rust
+fn is_empty(&self) -> Result<bool>
+```
+
+Returns `true` if no key-value pairs exist in the table.
+
+### stats
+
+```rust
+fn stats(&self) -> Result<TableStats>
+```
+
+Returns B-tree storage statistics. See [`TableStats`](/api/table#tablestats) for field descriptions.
+
+---
+
+## ReadOnlyMultimapTable\<K, V\>
+
+Obtained from `ReadTransaction::open_multimap_table`. Provides all `ReadableMultimapTable` methods. The inherent `get` and `range` methods on `ReadOnlyMultimapTable` return `'static`-lifetime iterators that keep the transaction alive via reference counting.
+
+```rust
+let read_txn = db.begin_read()?;
+let table = read_txn.open_multimap_table(TABLE)?;
+// 'static iterator — survives after read_txn is dropped
+let values: MultimapValue<'static, u64> = table.get("user:1")?;
+```
+
+<Note>
+  The inherent `get` / `range` on `ReadOnlyMultimapTable` return `'static` handles. The trait-method versions return handles tied to the borrow of the table (`'_`).
+</Note>
+
+---
+
+## MultimapValue\<V\>
+
+An iterator over the values associated with a single key, yielded in ascending order. Returned by `get` and `remove_all`.
+
+```rust
+pub struct MultimapValue<'a, V: Key + 'static> { /* ... */ }
+```
+
+Implements `Iterator` and `DoubleEndedIterator`. Each call to `next()` or `next_back()` yields:
+
+```rust
+Result<AccessGuard<'a, V>>
+```
+
+### len
+
+```rust
+pub fn len(&self) -> u64
+```
+
+Returns the number of values remaining in this iterator. This count decrements as values are consumed.
+
+<Note>
+  `len()` counts how many times `next()` will return `Some(Ok(_))`. It does not account for possible `Some(Err(_))` items that may be returned if an I/O error occurs.
+</Note>
+
+### is\_empty
+
+```rust
+pub fn is_empty(&self) -> bool
+```
+
+Returns `true` if `len() == 0`.
+
+```rust
+let values = table.get("user:1")?;
+if values.is_empty() {
+    println!("no values for user:1");
+} else {
+    println!("{} value(s)", values.len());
+    for v in values {
+        println!("  {}", v?.value());
+    }
+}
+```
+
+---
+
+## MultimapRange\<K, V\>
+
+An iterator over a range of keys, where each item provides the key and a value iterator.
+
+```rust
+pub struct MultimapRange<'a, K: Key + 'static, V: Key + 'static> { /* ... */ }
+```
+
+Implements `Iterator` and `DoubleEndedIterator`. Each item is:
+
+```rust
+Result<(AccessGuard<'a, K>, MultimapValue<'a, V>)>
+```
+
+Both the key guard and the value iterator are valid for the same lifetime `'a`, which is tied to the transaction. You can iterate forward, backward, or interleave both directions.
+
+```rust
+let mut range = table.range("user:0"..="user:9")?;
+
+// consume from the front
+let (k, vals) = range.next().unwrap()?;
+println!("first key: {}", k.value());
+
+// consume from the back
+let (k2, vals2) = range.next_back().unwrap()?;
+println!("last key: {}", k2.value());
+```

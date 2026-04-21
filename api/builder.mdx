@@ -1,0 +1,253 @@
+---
+title: "Builder — configure a redb database"
+description: "Reference for Builder: set cache size, configure the repair callback, and open or create a Database or ReadOnlyDatabase with a file path or custom backend."
+---
+
+`Builder` is the configuration entry point for opening or creating a redb database. It lets you tune the in-memory cache size and register a repair callback before the database file is opened. For simple cases you can use [`Database::create`](/api/database#databasecreate) or [`Database::open`](/api/database#databaseopen) directly, both of which internally call `Builder::new()` with default settings.
+
+## `Builder`
+
+```rust
+pub struct Builder { /* private fields */ }
+```
+
+### `Builder::new`
+
+```rust
+pub fn new() -> Self
+```
+
+Constructs a `Builder` with sensible defaults.
+
+| Setting | Default |
+|---|---|
+| `cache_size` | 1 GiB (1,073,741,824 bytes) |
+| `page_size` | 4 KiB (internal; not user-configurable in stable builds) |
+| `repair_callback` | no-op closure |
+
+```rust
+use redb::Builder;
+
+let db = Builder::new().create("my_data.redb")?;
+```
+
+---
+
+### `set_cache_size`
+
+```rust
+pub fn set_cache_size(&mut self, bytes: usize) -> &mut Self
+```
+
+Sets the maximum number of bytes used for the in-memory page cache. Larger values reduce I/O at the cost of memory. A value of `0` disables the cache entirely (useful for testing or memory-constrained environments).
+
+<ParamField path="bytes" type="usize" required>
+  Cache capacity in bytes. There is no minimum enforced by the API; `0` is valid.
+</ParamField>
+
+**Returns** `&mut Self` for method chaining.
+
+```rust
+use redb::Builder;
+
+// 128 MiB cache
+let db = Builder::new()
+    .set_cache_size(128 * 1024 * 1024)
+    .create("my_data.redb")?;
+```
+
+<Tip>
+  The default 1 GiB cache is generous for most workloads. Reduce it if your process has a tight memory budget, or increase it for databases with large hot working sets.
+</Tip>
+
+---
+
+### `set_repair_callback`
+
+```rust
+pub fn set_repair_callback(
+    &mut self,
+    callback: impl Fn(&mut RepairSession) + 'static,
+) -> &mut Self
+```
+
+Registers a closure that is called periodically when the database file requires repair. The `RepairSession` argument exposes progress information and an `abort` method. If no callback is set, repair proceeds silently.
+
+<ParamField path="callback" type="impl Fn(&mut RepairSession) + 'static" required>
+  A closure that receives a `&mut RepairSession`. Must be `'static` (no non-static borrows).
+</ParamField>
+
+**Returns** `&mut Self` for method chaining.
+
+The callback is invoked at least once if repair is needed, and may be invoked multiple times at different progress values. If the database opens cleanly the callback is never called.
+
+```rust
+use redb::{Builder, RepairSession};
+
+let db = Builder::new()
+    .set_repair_callback(|s: &mut RepairSession| {
+        eprintln!("redb: repairing database ({:.0}%)", s.progress() * 100.0);
+    })
+    .create("my_data.redb")?;
+```
+
+To cancel the repair and have `create` / `open` return `DatabaseError::RepairAborted`, call `session.abort()` inside the callback:
+
+```rust
+use redb::{Builder, RepairSession};
+
+let result = Builder::new()
+    .set_repair_callback(|s: &mut RepairSession| {
+        // Refuse automatic repair
+        s.abort();
+    })
+    .open("my_data.redb");
+
+// result is Err(DatabaseError::RepairAborted) if repair was needed
+```
+
+---
+
+### `create`
+
+```rust
+pub fn create(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError>
+```
+
+Opens the file at `path` as a redb database, creating and initialising it if it does not exist or is empty. Equivalent to [`Database::create`](/api/database#databasecreate) but respects any settings applied to the builder.
+
+<ParamField path="path" type="impl AsRef<Path>" required>
+  Filesystem path to the database file. The file is created if it does not exist.
+</ParamField>
+
+**Returns** `Result<Database, DatabaseError>`
+
+**Errors**
+
+| Variant | When |
+|---|---|
+| `DatabaseError::DatabaseAlreadyOpen` | Another process holds the write lock (where file locking is supported). |
+| `DatabaseError::RepairAborted` | Repair was needed and the callback called `session.abort()`. |
+| `DatabaseError::UpgradeRequired(version)` | The file uses an unsupported older format. |
+| `DatabaseError::Storage(StorageError::Io(_))` | An I/O error occurred. |
+
+```rust
+use redb::Builder;
+
+let db = Builder::new()
+    .set_cache_size(64 * 1024 * 1024)
+    .create("my_data.redb")?;
+```
+
+---
+
+### `open`
+
+```rust
+pub fn open(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError>
+```
+
+Opens an existing database at `path`. Returns an error if the file does not exist. Unlike `create`, it never initialises a new database.
+
+<ParamField path="path" type="impl AsRef<Path>" required>
+  Path to an existing redb database file.
+</ParamField>
+
+**Returns** `Result<Database, DatabaseError>`
+
+**Errors** — same variants as [`create`](#create).
+
+```rust
+let db = Builder::new()
+    .set_cache_size(512 * 1024 * 1024)
+    .open("my_data.redb")?;
+```
+
+---
+
+### `open_read_only`
+
+```rust
+pub fn open_read_only(
+    &self,
+    path: impl AsRef<Path>,
+) -> Result<ReadOnlyDatabase, DatabaseError>
+```
+
+Opens an existing database in read-only mode, returning a [`ReadOnlyDatabase`](/api/database#readonlydatabase). Multiple processes may call this simultaneously, but it will fail if the file is already open as a writable `Database`.
+
+<Warning>
+  Read-only mode requires the database to have been closed cleanly. If repair would be needed, this returns `DatabaseError::RepairAborted` because repair requires write access.
+</Warning>
+
+<ParamField path="path" type="impl AsRef<Path>" required>
+  Path to an existing redb database file.
+</ParamField>
+
+**Returns** `Result<ReadOnlyDatabase, DatabaseError>`
+
+```rust
+use redb::Builder;
+
+let db = Builder::new()
+    .set_cache_size(32 * 1024 * 1024)
+    .open_read_only("my_data.redb")?;
+```
+
+---
+
+### `create_with_backend`
+
+```rust
+pub fn create_with_backend(
+    &self,
+    backend: impl StorageBackend,
+) -> Result<Database, DatabaseError>
+```
+
+Opens or creates a database using a custom [`StorageBackend`](/api/storage-backend) implementation instead of a file. The backend is treated as writable; if it is empty a new database is initialised in it.
+
+This is the primary way to use the built-in `InMemoryBackend` or any custom storage.
+
+<ParamField path="backend" type="impl StorageBackend" required>
+  Any type that implements `StorageBackend`. Must satisfy `'static + Debug + Send + Sync`.
+</ParamField>
+
+**Returns** `Result<Database, DatabaseError>`
+
+```rust
+use redb::{Builder, backends::InMemoryBackend};
+
+let db = Builder::new()
+    .create_with_backend(InMemoryBackend::new())?;
+```
+
+---
+
+### `create_file`
+
+```rust
+pub fn create_file(&self, file: File) -> Result<Database, DatabaseError>
+```
+
+Opens or creates a database from an already-open `std::fs::File` handle. Useful when you need to control how the file is opened (e.g. with custom permissions) before passing it to redb.
+
+<ParamField path="file" type="std::fs::File" required>
+  An open file handle. The file must be empty or contain a valid redb database.
+</ParamField>
+
+**Returns** `Result<Database, DatabaseError>`
+
+```rust
+use std::fs::OpenOptions;
+use redb::Builder;
+
+let file = OpenOptions::new()
+    .read(true)
+    .write(true)
+    .create(true)
+    .truncate(false)
+    .open("my_data.redb")?;
+
+let db = Builder::new().create_file(file)?;
+```

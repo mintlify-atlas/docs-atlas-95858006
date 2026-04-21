@@ -1,0 +1,265 @@
+---
+title: "StorageBackend trait — custom storage"
+description: "Reference for the StorageBackend trait and its built-in implementations: FileBackend for on-disk storage and InMemoryBackend for ephemeral in-process storage."
+---
+
+The `StorageBackend` trait abstracts the raw byte-addressable storage that redb reads from and writes to. The default implementation, `FileBackend`, stores the database in an ordinary file. `InMemoryBackend` provides a non-persistent, in-process alternative useful for testing. You can also supply your own implementation to store a database in object storage, a memory-mapped buffer, or any other medium.
+
+## `StorageBackend` trait
+
+```rust
+pub trait StorageBackend: 'static + Debug + Send + Sync {
+    fn len(&self) -> Result<u64, io::Error>;
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), io::Error>;
+    fn set_len(&self, len: u64) -> Result<(), io::Error>;
+    fn sync_data(&self) -> Result<(), io::Error>;
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), io::Error>;
+
+    // Provided method (default: no-op Ok(()))
+    fn close(&self) -> Result<(), io::Error> { ... }
+}
+```
+
+The trait is sealed in the sense that every implementor must also satisfy `'static + Debug + Send + Sync`. All methods except `close` are required; `close` has a default no-op implementation.
+
+---
+
+### `len`
+
+```rust
+fn len(&self) -> Result<u64, io::Error>
+```
+
+Returns the current byte length of the storage.
+
+**Returns** `Result<u64, io::Error>`
+
+---
+
+### `read`
+
+```rust
+fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), io::Error>
+```
+
+Reads exactly `out.len()` bytes starting at `offset` into `out`.
+
+<ParamField path="offset" type="u64" required>
+  Byte offset from the beginning of the storage to start reading.
+</ParamField>
+
+<ParamField path="out" type="&mut [u8]" required>
+  Buffer to fill. Must be fully populated on success.
+</ParamField>
+
+**Returns** `Result<(), io::Error>`
+
+If `offset + out.len()` exceeds the current length of the storage, an appropriate `io::Error` must be returned.
+
+---
+
+### `set_len`
+
+```rust
+fn set_len(&self, len: u64) -> Result<(), io::Error>
+```
+
+Resizes the storage to exactly `len` bytes. New bytes added by an extension must be initialised to zero. Truncation discards data beyond `len`.
+
+<ParamField path="len" type="u64" required>
+  New byte length of the storage.
+</ParamField>
+
+**Returns** `Result<(), io::Error>`
+
+---
+
+### `sync_data`
+
+```rust
+fn sync_data(&self) -> Result<(), io::Error>
+```
+
+Flushes all buffered writes to persistent storage. redb calls this method at transaction commit boundaries to satisfy durability guarantees. For non-persistent backends (such as `InMemoryBackend`) a no-op implementation is correct.
+
+**Returns** `Result<(), io::Error>`
+
+---
+
+### `write`
+
+```rust
+fn write(&self, offset: u64, data: &[u8]) -> Result<(), io::Error>
+```
+
+Writes `data` into the storage beginning at `offset`. The write must be fully applied before returning `Ok`.
+
+<ParamField path="offset" type="u64" required>
+  Byte offset at which to begin writing.
+</ParamField>
+
+<ParamField path="data" type="&[u8]" required>
+  Bytes to write.
+</ParamField>
+
+**Returns** `Result<(), io::Error>`
+
+---
+
+### `close`
+
+```rust
+fn close(&self) -> Result<(), io::Error>
+```
+
+*Provided method — default implementation returns `Ok(())`.*
+
+Called exactly once when the `Database` is dropped. After this call redb will not access the backend again. Use this method to release file locks, flush buffers, or free any resources held by the backend.
+
+**Returns** `Result<(), io::Error>`
+
+---
+
+## Built-in implementations
+
+### `FileBackend`
+
+```rust
+pub struct FileBackend { /* private fields */ }
+```
+
+The default storage backend. Stores the database as a flat file on disk. Acquires an exclusive advisory file lock on open (on platforms that support it: Linux, macOS, Windows) to prevent two writable `Database` instances from opening the same file simultaneously.
+
+#### `FileBackend::new`
+
+```rust
+pub fn new(file: File) -> Result<Self, DatabaseError>
+```
+
+Creates a new `FileBackend` from an already-open `std::fs::File`.
+
+<ParamField path="file" type="std::fs::File" required>
+  An open, readable, and writable file handle.
+</ParamField>
+
+**Returns** `Result<FileBackend, DatabaseError>`
+
+**Errors**
+
+| Variant | When |
+|---|---|
+| `DatabaseError::DatabaseAlreadyOpen` | The file lock is already held by another process. |
+| `DatabaseError::Storage(StorageError::Io(_))` | An I/O error occurred while acquiring the lock. |
+
+```rust
+use std::fs::OpenOptions;
+use redb::{Builder, backends::FileBackend};
+
+let file = OpenOptions::new()
+    .read(true)
+    .write(true)
+    .create(true)
+    .truncate(false)
+    .open("my_data.redb")?;
+
+let backend = FileBackend::new(file)?;
+let db = Builder::new().create_with_backend(backend)?;
+```
+
+<Note>
+  On platforms where file locking is unsupported, `FileBackend::new` succeeds but logs a warning. In that case it is the caller's responsibility to ensure only one writable `Database` accesses the file at a time.
+</Note>
+
+---
+
+### `InMemoryBackend`
+
+```rust
+pub struct InMemoryBackend(/* private */);
+```
+
+A fully in-process, non-persistent storage backend backed by a `Vec<u8>` protected by a `RwLock`. All data is lost when the `Database` is dropped. This backend is primarily intended for testing and short-lived in-memory caches.
+
+#### `InMemoryBackend::new`
+
+```rust
+pub fn new() -> Self
+```
+
+Creates a new, empty in-memory backend.
+
+```rust
+use redb::{Builder, backends::InMemoryBackend};
+
+let db = Builder::new()
+    .create_with_backend(InMemoryBackend::new())?;
+
+// Write something
+let write_txn = db.begin_write()?;
+write_txn.commit()?;
+
+// All data is gone when `db` is dropped
+```
+
+`InMemoryBackend` also implements `Default`.
+
+---
+
+## Implementing a custom backend
+
+To use redb with non-file storage, implement `StorageBackend` on your type. The skeleton below shows the required structure:
+
+```rust
+use redb::StorageBackend;
+use std::io;
+
+#[derive(Debug)]
+struct MyBackend {
+    // your fields here
+}
+
+impl StorageBackend for MyBackend {
+    fn len(&self) -> Result<u64, io::Error> {
+        // return the current byte length
+        todo!()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), io::Error> {
+        // fill `out` with bytes starting at `offset`
+        // return an error if offset + out.len() > self.len()
+        todo!()
+    }
+
+    fn set_len(&self, len: u64) -> Result<(), io::Error> {
+        // resize to exactly `len` bytes; zero-fill any new bytes
+        todo!()
+    }
+
+    fn sync_data(&self) -> Result<(), io::Error> {
+        // flush buffered writes to durable storage
+        // for non-persistent backends: Ok(())
+        todo!()
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), io::Error> {
+        // write `data` at `offset`
+        todo!()
+    }
+
+    // Optional: release resources when the Database is dropped
+    fn close(&self) -> Result<(), io::Error> {
+        Ok(())
+    }
+}
+```
+
+Once implemented, pass your backend via [`Builder::create_with_backend`](/api/builder#create_with_backend):
+
+```rust
+let db = redb::Builder::new()
+    .create_with_backend(MyBackend { /* ... */ })?;
+```
+
+<Warning>
+  redb assumes that `write` is atomic at the page level and that `sync_data` guarantees all previous writes are durable before it returns. Violating these contracts can result in database corruption or data loss on crash.
+</Warning>

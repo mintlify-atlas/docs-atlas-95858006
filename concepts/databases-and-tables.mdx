@@ -1,0 +1,145 @@
+---
+title: "Understanding databases and tables in redb"
+description: "Learn how redb organizes data into databases and typed tables, how to define table schemas with TableDefinition, and how to list and manage tables."
+---
+
+redb organizes persistent data into a single database file that contains one or more named tables. Each table is a sorted key-value map. This page explains the `Database` struct, how to configure it with `Builder`, how to define typed table handles with `TableDefinition`, and how to enumerate tables at runtime.
+
+## The Database struct
+
+`Database` is the entry point for all redb operations. You open or create a database by pointing it at a file path. If the file does not exist (or is empty), redb initializes a fresh database. If the file already contains a valid redb database, it is reopened.
+
+```rust
+use redb::{Database, Error};
+
+fn main() -> Result<(), Error> {
+    // Creates the file if it does not exist, opens it otherwise
+    let db = Database::create("my_database.redb")?;
+    Ok(())
+}
+```
+
+If you want to open a file that must already exist—and return an error if it does not—use `Database::open` instead:
+
+```rust
+let db = Database::open("existing.redb")?;
+```
+
+### Configuring with Builder
+
+`Builder` lets you tune the database before opening it. The most commonly adjusted knob is the in-memory read cache size (default 1 GiB):
+
+```rust
+use redb::{Builder, Error};
+
+fn main() -> Result<(), Error> {
+    let db = Builder::new()
+        .set_cache_size(64 * 1024 * 1024) // 64 MiB
+        .create("my_database.redb")?;
+    Ok(())
+}
+```
+
+`Builder` also exposes `set_repair_callback`, which is called during the crash-recovery scan if the database was not shut down cleanly. The callback receives a `RepairSession` that lets you monitor progress or abort the repair.
+
+<Note>
+`Builder::create` initializes a new database if the file is absent or empty. `Builder::open` requires the file to already be a valid redb database and returns an error otherwise.
+</Note>
+
+## Defining tables with TableDefinition
+
+Tables in redb are strongly typed. Before you can open a table you declare it as a compile-time constant using `TableDefinition<K, V>`, where `K` is the key type and `V` is the value type. Both must implement the `Key` or `Value` trait (described in [Type system and values](/concepts/types-and-values)).
+
+```rust
+use redb::TableDefinition;
+
+// A table named "my_data" that maps u64 keys to u64 values
+const TABLE: TableDefinition<u64, u64> = TableDefinition::new("my_data");
+```
+
+`TableDefinition` is `Copy`, so you can pass it around freely without cloning. The name must be a non-empty string; passing an empty string panics at compile time for string literals.
+
+The type parameters are purely a Rust-level construct—they do not add overhead to the stored data. When a table is opened, redb checks the stored key and value type names against those encoded in `TableDefinition`. If they do not match, `open_table` returns a `TableError::TableTypeMismatch` error, catching schema mismatches at runtime before any data is read or written.
+
+<Tip>
+Declare your `TableDefinition` constants at the module level so they are shared across all code that touches the same table. This is the idiomatic redb pattern and prevents accidental type mismatches between callers.
+</Tip>
+
+## Opening tables in a transaction
+
+A `TableDefinition` is just a description; to actually read or write data you must open the table inside a transaction. Opening a table in a `WriteTransaction` creates the table if it does not yet exist:
+
+```rust
+use redb::{Database, Error, ReadableDatabase, ReadableTable, TableDefinition};
+
+const TABLE: TableDefinition<u64, u64> = TableDefinition::new("my_data");
+
+fn main() -> Result<(), Error> {
+    let db = Database::create("my_database.redb")?;
+
+    // Write transaction: opens (and creates if needed) the table
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(TABLE)?;
+        table.insert(&42, &100)?;
+    }
+    write_txn.commit()?;
+
+    // Read transaction: the table must already exist
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(TABLE)?;
+    assert_eq!(table.get(&42)?.unwrap().value(), 100);
+
+    Ok(())
+}
+```
+
+The `Table` (mutable) and `ReadOnlyTable` (read-only) objects borrow the transaction for their lifetime, so they are dropped before the transaction is committed or aborted.
+
+## ReadOnlyDatabase
+
+For processes that only need to read from a database file—such as a monitoring tool or an analytics job—`ReadOnlyDatabase` opens the file without acquiring a write lock:
+
+```rust
+use redb::{ReadOnlyDatabase, ReadableDatabase, TableDefinition};
+
+const TABLE: TableDefinition<u64, u64> = TableDefinition::new("my_data");
+
+fn main() -> Result<(), redb::Error> {
+    let db = ReadOnlyDatabase::open("my_database.redb")?;
+    let txn = db.begin_read()?;
+    let table = txn.open_table(TABLE)?;
+    println!("{:?}", table.get(&42)?);
+    Ok(())
+}
+```
+
+<Warning>
+`ReadOnlyDatabase` requires the database to have been shut down cleanly (using 2-phase commit). If the file has not been closed properly, `open` returns `DatabaseError::RepairAborted` rather than attempting an in-place repair, because repair requires write access.
+</Warning>
+
+Multiple processes may hold a `ReadOnlyDatabase` open simultaneously, but a `ReadOnlyDatabase` and a `Database` must not be open on the same file at the same time on platforms that support file locking (Linux, macOS, Windows).
+
+## Listing tables
+
+Both `WriteTransaction` and `ReadTransaction` expose `list_tables` and `list_multimap_tables` to enumerate tables without knowing their types in advance. Each returns an iterator of `UntypedTableHandle` values that carry only the table name:
+
+```rust
+let write_txn = db.begin_write()?;
+
+for handle in write_txn.list_tables()? {
+    println!("table: {}", handle.name());
+}
+
+for handle in write_txn.list_multimap_tables()? {
+    println!("multimap table: {}", handle.name());
+}
+
+write_txn.abort()?;
+```
+
+## Type safety model
+
+The type information for each table—the serialized `TypeName` of the key and value types—is stored in the database file alongside the table data. When you call `open_table`, redb looks up the stored type names and compares them to the type names produced by the `K` and `V` parameters of the `TableDefinition` you supplied. A mismatch returns an error immediately, before any reads or writes occur, so there is no risk of silently misinterpreting stored bytes as the wrong type.
+
+Because `TableDefinition` carries its key and value types at compile time, the Rust type checker enforces correct usage within a single build. The runtime check catches cases where the on-disk schema was created by a different version of the application with different types.
